@@ -1,0 +1,31 @@
+[project]
+name = "metaflow-temporal"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "metaflow>=2.9",
+    "temporalio>=1.0",
+    "click>=8.0",
+    "chevron>=0.14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+    "temporalio[testing]>=1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["metaflow_extensions*"]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires external Temporal server (docker-compose)",
+]

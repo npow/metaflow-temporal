@@ -1,0 +1,22 @@
+# Generated Temporal worker for {{flow_name}}
+# Deployed on: {{deployed_on}}
+# DO NOT EDIT — regenerate with: python {{flow_file}} temporal create
+
+import asyncio
+import json
+import sys
+
+CONFIG = json.loads(r"""{{{config}}}""")
+
+{{{utils}}}
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "trigger":
+        _params = {}
+        for _arg in sys.argv[2:]:
+            if "=" in _arg:
+                _k, _v = _arg.split("=", 1)
+                _params[_k] = _v
+        asyncio.run(WorkerUtils.trigger(CONFIG, _params))
+    else:
+        asyncio.run(WorkerUtils.run_worker(CONFIG))
