@@ -655,6 +655,9 @@ class WorkerUtils:
         cron = schedule_cfg["cron"]
         timezone = schedule_cfg.get("timezone")
 
+        timeout_seconds = config.get("workflow_timeout_seconds")
+        execution_timeout = timedelta(seconds=timeout_seconds) if timeout_seconds else None
+
         try:
             await client.create_schedule(
                 schedule_id,
@@ -664,6 +667,7 @@ class WorkerUtils:
                         {"config": config, "params": {}},
                         id="%s-scheduled" % flow_name.lower(),
                         task_queue=config["task_queue"],
+                        execution_timeout=execution_timeout,
                     ),
                     spec=ScheduleSpec(
                         cron_expressions=[cron],
@@ -682,11 +686,14 @@ class WorkerUtils:
         """Trigger a workflow run and wait for completion."""
         client = await Client.connect(config["temporal_host"])
         workflow_id = "%s-%s" % (config["flow_name"].lower(), uuid.uuid4().hex[:8])
+        timeout_seconds = config.get("workflow_timeout_seconds")
+        execution_timeout = timedelta(seconds=timeout_seconds) if timeout_seconds else None
         result = await client.execute_workflow(
             MetaflowWorkflow.run,
             {"config": config, "params": params},
             id=workflow_id,
             task_queue=config["task_queue"],
+            execution_timeout=execution_timeout,
         )
         print("Workflow completed. Run ID: %s" % result)
         return result

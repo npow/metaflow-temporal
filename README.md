@@ -152,7 +152,42 @@ python daily_flow_worker.py  # registers the schedule and starts listening
 Tags are attached to every run produced by the worker:
 
 ```bash
-python my_flow.py temporal create my_flow_worker.py --tag team:ml --tag env:prod
+python my_flow.py temporal create --output my_flow_worker.py --tag team:ml --tag env:prod
+```
+
+### Project namespace isolation
+
+Flows decorated with `@project` get full namespace isolation between branches. Different branches
+use separate task queues and store runs under the project-aware name
+(`<project>.<branch>.<FlowName>`), so user, staging, and production deployments never collide.
+
+```python
+from metaflow import FlowSpec, project, step
+
+@project(name="myproject")
+class TrainFlow(FlowSpec):
+    ...
+```
+
+```bash
+# User branch (default): myproject.user.alice.TrainFlow
+python train_flow.py temporal create --output train_worker.py
+
+# Named test branch: myproject.test.staging.TrainFlow
+python train_flow.py temporal create --output train_worker.py --branch staging
+
+# Production: myproject.prod.TrainFlow
+python train_flow.py temporal create --output train_worker.py --production
+```
+
+Project tags (`project:myproject`, `project_branch:prod`) are automatically added to every run.
+
+### Workflow execution timeout
+
+Cap how long a single workflow execution may run before Temporal cancels it:
+
+```bash
+python my_flow.py temporal create --output my_flow_worker.py --workflow-timeout 7200
 ```
 
 ## How it works

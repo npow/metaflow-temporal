@@ -429,6 +429,157 @@ class TestCompilation:
         assert flaky_step["retries"] == 2
         assert flaky_step["retry_delay_seconds"] == 60  # 1 minute
 
+    def test_workflow_timeout_in_config(self, tmp_path):
+        import subprocess
+
+        out_file = str(tmp_path / "worker.py")
+        subprocess.run(
+            [
+                sys.executable,
+                str(FLOWS_DIR / "linear_flow.py"),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+                "--workflow-timeout", "7200",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        config = _extract_config_from_worker(out_file)
+        assert config.get("workflow_timeout_seconds") == 7200
+
+    def test_no_workflow_timeout_by_default(self, tmp_path):
+        import subprocess
+
+        out_file = str(tmp_path / "worker.py")
+        subprocess.run(
+            [
+                sys.executable,
+                str(FLOWS_DIR / "linear_flow.py"),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        config = _extract_config_from_worker(out_file)
+        assert config.get("workflow_timeout_seconds") is None
+
+    def test_project_flow_name_in_config(self, tmp_path):
+        """@project should produce a project-aware flow_name in CONFIG."""
+        import subprocess
+
+        out_file = str(tmp_path / "worker.py")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(FLOWS_DIR / "project_flow.py"),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        config = _extract_config_from_worker(out_file)
+        # flow_name should be project-aware: myproject.<branch>.ProjectFlow
+        assert config["flow_name"].startswith("myproject.")
+        assert config["flow_name"].endswith(".ProjectFlow")
+        assert config.get("project") is not None
+        assert config["project"]["name"] == "myproject"
+
+    def test_project_production_branch(self, tmp_path):
+        """--production should produce branch 'prod'."""
+        import subprocess
+
+        out_file = str(tmp_path / "worker.py")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(FLOWS_DIR / "project_flow.py"),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+                "--production",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        config = _extract_config_from_worker(out_file)
+        assert config["flow_name"] == "myproject.prod.ProjectFlow"
+        assert config["project"]["branch"] == "prod"
+
+    def test_project_custom_branch(self, tmp_path):
+        """--branch should produce a test.<branch> branch name."""
+        import subprocess
+
+        out_file = str(tmp_path / "worker.py")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(FLOWS_DIR / "project_flow.py"),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+                "--branch", "staging",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        config = _extract_config_from_worker(out_file)
+        assert config["flow_name"] == "myproject.test.staging.ProjectFlow"
+        assert config["project"]["branch"] == "test.staging"
+
+    def test_project_tags_auto_added(self, tmp_path):
+        """@project should auto-add project: and project_branch: tags."""
+        import subprocess
+
+        out_file = str(tmp_path / "worker.py")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(FLOWS_DIR / "project_flow.py"),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+                "--production",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        config = _extract_config_from_worker(out_file)
+        assert "project:myproject" in config["tags"]
+        assert "project_branch:prod" in config["tags"]
+
 
 class TestConditionalFlow:
     """Tests for split/join (conditional-style branching)."""

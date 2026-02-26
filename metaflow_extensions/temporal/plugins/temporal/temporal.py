@@ -35,6 +35,9 @@ class Temporal:
         max_workers=10,
         task_queue=None,
         temporal_host="localhost:7233",
+        branch=None,
+        production=False,
+        workflow_timeout_seconds=None,
     ):
         self.name = name
         self.graph = graph
@@ -49,8 +52,21 @@ class Temporal:
         self.namespace = namespace
         self.username = username
         self.max_workers = max_workers
-        self.task_queue = task_queue or "metaflow-%s" % name.lower()
         self.temporal_host = temporal_host
+        self.branch = branch
+        self.production = production
+        self.workflow_timeout_seconds = workflow_timeout_seconds
+
+        # Compute @project info and derive the effective flow name.
+        # Must happen after all self.* assignments above.
+        self._project_info = self._get_project()
+        effective_name = (
+            self._project_info["flow_name"] if self._project_info else name
+        )
+        # Sanitize dots to hyphens for the task queue name.
+        self.task_queue = task_queue or (
+            "metaflow-%s" % effective_name.lower().replace(".", "-")
+        )
 
     def compile(self) -> str:
         config = self._build_config()
@@ -58,15 +74,24 @@ class Temporal:
 
     def _build_config(self) -> dict:
         datastore_root = getattr(self.flow_datastore, "datastore_root", None) or ""
+        # Use project-aware flow name if @project is present
+        flow_name = (
+            self._project_info["flow_name"] if self._project_info else self.name
+        )
+        # Merge user tags with auto-added project tags
+        tags = list(self.tags)
+        if self._project_info:
+            tags = tags + [
+                "project:%s" % self._project_info["name"],
+                "project_branch:%s" % self._project_info["branch"],
+            ]
         return {
-            "flow_name": self.name,
+            "flow_name": flow_name,
             "flow_file": self.flow_file,
             "task_queue": self.task_queue,
             "temporal_host": self.temporal_host,
             "max_workers": self.max_workers,
             # Runtime provider types — forwarded as CLI flags to each step subprocess.
-            # These reflect whatever backend the user has configured (service metadata,
-            # S3/GCS datastore, conda environment, etc.).
             "metadata_type": self.metadata.TYPE,
             "datastore_type": self.flow_datastore.TYPE,
             "datastore_root": datastore_root,
@@ -76,9 +101,13 @@ class Temporal:
             "parameters": self._process_parameters(),
             "steps": self._build_steps(),
             # Tags forwarded as --tag flags to each step subprocess
-            "tags": self.tags,
+            "tags": tags,
             # @schedule decorator config — used to register a Temporal Schedule
             "schedule": self._get_schedule(),
+            # @project info — for display and diagnostics
+            "project": self._project_info,
+            # Workflow execution timeout in seconds (None = no limit)
+            "workflow_timeout_seconds": self.workflow_timeout_seconds,
         }
 
     def _process_parameters(self) -> dict:
@@ -89,7 +118,6 @@ class Temporal:
                 "name": param.name,
                 "default": None,
             }
-            # Try to get the default value
             try:
                 default = param.kwargs.get("default")
                 if default is not None and not callable(default):
@@ -111,10 +139,8 @@ class Temporal:
                 "timeout_seconds": self._get_timeout(node),
                 "retries": self._get_retries(node),
                 "retry_delay_seconds": self._get_retry_delay(node),
-                # Decorator backend specs, e.g. ["kubernetes:image=python:3.11,cpu=2",
-                # "conda:packages=['numpy']", "sandbox:backend=daytona"].
-                # Forwarded as --with=<spec> flags to the step subprocess so that
-                # compute backends (@kubernetes, @batch, @sandbox, etc.) take effect.
+                # Decorator backend specs, e.g. ["kubernetes:image=python:3.11,cpu=2"].
+                # Forwarded as --with=<spec> flags to the step subprocess.
                 "decorator_specs": self._get_decorator_specs(node),
             }
         return steps
@@ -123,13 +149,8 @@ class Temporal:
         """Return --with-compatible spec strings for user-defined step decorators."""
         specs = []
         for d in node.decorators:
-            # Skip injected decorators (e.g. environment, retry added by Metaflow
-            # internals) and our own temporal_internal decorator.
             if d.name in ("temporal_internal",):
                 continue
-            # Only forward decorators that are compute/environment backends —
-            # skip ones that are purely metadata/config (e.g. retry, timeout,
-            # environment which we handle separately).
             if d.name in ("retry", "timeout", "environment", "project", "trigger",
                           "trigger_on_finish", "schedule", "card"):
                 continue
@@ -150,7 +171,11 @@ class Temporal:
         if env_deco:
             env.update(env_deco[0].attributes.get("vars", {}))
 
-        env["METAFLOW_FLOW_NAME"] = self.flow.name
+        # Use project-aware flow name if @project is present
+        flow_name = (
+            self._project_info["flow_name"] if self._project_info else self.flow.name
+        )
+        env["METAFLOW_FLOW_NAME"] = flow_name
         env["METAFLOW_STEP_NAME"] = node.name
         env["METAFLOW_OWNER"] = self.username or ""
         env["METAFLOW_DEFAULT_DATASTORE"] = self.flow_datastore.TYPE
@@ -162,9 +187,6 @@ class Temporal:
             env["METAFLOW_DATASTORE_SYSROOT_%s" % self.flow_datastore.TYPE.upper()] = datastore_root
 
         # Metadata service URL — needed when using the service metadata provider.
-        # These are already in the worker's os.environ if configured, but we
-        # explicitly capture them so they survive in generated worker files that
-        # may be deployed to a different machine.
         try:
             from metaflow import metaflow_config as mfc
             for var in ("SERVICE_URL", "SERVICE_INTERNAL_URL", "SERVICE_AUTH_KEY"):
@@ -198,7 +220,7 @@ class Temporal:
             if deco.name == "retry":
                 minutes = float(deco.attributes.get("minutes_between_retries", 2))
                 return int(minutes * 60)
-        return 120  # 2-minute default, matching Metaflow's default
+        return 120  # 2-minute default
 
     def _get_schedule(self) -> Optional[dict]:
         """Extract @schedule decorator config from flow-level decorators."""
@@ -222,6 +244,34 @@ class Temporal:
         except Exception:
             pass
         return None
+
+    def _get_project(self) -> Optional[dict]:
+        """Extract @project decorator config and compute the project-aware flow name."""
+        try:
+            from metaflow.plugins.project_decorator import format_name
+
+            flow_decos = getattr(self.flow, "_flow_decorators", {})
+            project_list = flow_decos.get("project", [])
+            if not project_list:
+                return None
+            d = project_list[0]
+            project_name = d.attributes.get("name")
+            if not project_name:
+                return None
+            project_flow_name, branch_name = format_name(
+                self.name,
+                project_name,
+                self.production,
+                self.branch,
+                self.username or "",
+            )
+            return {
+                "name": project_name,
+                "flow_name": project_flow_name,
+                "branch": branch_name,
+            }
+        except Exception:
+            return None
 
     def _render_template(self, config: dict) -> str:
         try:

@@ -35,12 +35,38 @@ def temporal(obj):
     type=int,
     help="Max concurrent activity workers",
 )
-@click.option("--tag", "tags", multiple=True, help="Tags to attach to runs")
+@click.option("--tag", "tags", multiple=True, help="Tags to attach to all runs")
 @click.option("--namespace", default=None, help="Metaflow namespace")
-def create(obj, output, task_queue, temporal_host, max_workers, tags, namespace):
+@click.option(
+    "--branch",
+    default=None,
+    help="@project branch name (default: user.<username>)",
+)
+@click.option(
+    "--production",
+    is_flag=True,
+    default=False,
+    help="Deploy to the @project production branch",
+)
+@click.option(
+    "--workflow-timeout",
+    default=None,
+    type=int,
+    help="Maximum seconds a workflow execution may run (default: no limit)",
+)
+def create(
+    obj,
+    output,
+    task_queue,
+    temporal_host,
+    max_workers,
+    tags,
+    namespace,
+    branch,
+    production,
+    workflow_timeout,
+):
     flow_name = obj.graph.name
-    if task_queue is None:
-        task_queue = "metaflow-%s" % flow_name.lower()
     if output is None:
         output = "%s_temporal_worker.py" % flow_name.lower()
 
@@ -60,6 +86,9 @@ def create(obj, output, task_queue, temporal_host, max_workers, tags, namespace)
         max_workers=max_workers,
         task_queue=task_queue,
         temporal_host=temporal_host,
+        branch=branch,
+        production=production,
+        workflow_timeout_seconds=workflow_timeout,
     )
 
     worker_code = t.compile()
@@ -68,5 +97,11 @@ def create(obj, output, task_queue, temporal_host, max_workers, tags, namespace)
         f.write(worker_code)
 
     click.echo("Worker written to: %s" % output)
+    if t._project_info:
+        click.echo(
+            "Project: %s, Branch: %s"
+            % (t._project_info["name"], t._project_info["branch"])
+        )
+        click.echo("Flow name (in datastore): %s" % t._project_info["flow_name"])
     click.echo("Start worker:  python %s" % output)
     click.echo("Trigger run:   python %s trigger [key=value ...]" % output)
