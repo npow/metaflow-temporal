@@ -1,6 +1,23 @@
 [project]
 name = "metaflow-temporal"
-version = "0.1.0"
+version = "0.1.1"
+description = "Run Metaflow flows as Temporal workflows"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Nissan Pow", email = "nissan.pow@gmail.com" }]
+keywords = ["metaflow", "temporal", "workflow", "orchestration", "mlops"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 requires-python = ">=3.10"
 dependencies = [
     "metaflow>=2.9",
@@ -16,6 +33,10 @@ dev = [
     "pytest-timeout>=2.0",
     "temporalio[testing]>=1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/npow/metaflow-temporal"
+Repository = "https://github.com/npow/metaflow-temporal"
 
 [tool.setuptools.packages.find]
 include = ["metaflow_extensions*"]
