@@ -13,6 +13,7 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.23",
+    "pytest-timeout>=2.0",
     "temporalio[testing]>=1.0",
 ]
 
