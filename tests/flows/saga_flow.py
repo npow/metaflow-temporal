@@ -1,8 +1,8 @@
 import json
 import os
 
-from metaflow import FlowSpec, step
-from metaflow_extensions.temporal.plugins.temporal import compensate
+from metaflow import FlowSpec
+from metaflow_extensions.temporal.plugins.temporal import step
 
 _LOG_FILE = "/tmp/saga_test_log.json"
 
@@ -25,10 +25,18 @@ class SagaFlow(FlowSpec):
         self.booking_a_id = "hotel-123"
         self.next(self.book_b)
 
+    @book_a.compensate
+    def cancel_a(self):
+        _append_log({"action": "cancel_a", "booking_id": self.booking_a_id})
+
     @step
     def book_b(self):
         self.booking_b_id = "flight-456"
         self.next(self.fail_step)
+
+    @book_b.compensate
+    def cancel_b(self):
+        _append_log({"action": "cancel_b", "booking_id": self.booking_b_id})
 
     @step
     def fail_step(self):
@@ -38,14 +46,6 @@ class SagaFlow(FlowSpec):
     @step
     def end(self):
         pass
-
-    @compensate("book_a")
-    def cancel_a(self):
-        _append_log({"action": "cancel_a", "booking_id": self.booking_a_id})
-
-    @compensate("book_b")
-    def cancel_b(self):
-        _append_log({"action": "cancel_b", "booking_id": self.booking_b_id})
 
 
 def _append_log(entry: dict):

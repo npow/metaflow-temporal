@@ -1,17 +1,31 @@
-def compensate(step: str):
-    """Decorator marking a FlowSpec method as a saga compensation for `step`.
+def step(fn):
+    """Drop-in replacement for metaflow.step that adds optional .compensate support.
 
-    The decorated method receives the forward step's artifacts as self.<attr>.
-    Compensation methods are plain Python methods (NOT @step-decorated) and
-    must not call self.next().
+    Use exactly like metaflow's @step. To declare a compensation handler, decorate
+    a plain method immediately after with @<step_name>.compensate:
 
-    Example::
+        from metaflow import FlowSpec
+        from metaflow_extensions.temporal.plugins.temporal import step
 
-        @compensate("book_hotel")
-        def cancel_hotel(self):
-            cancel_reservation(self.hotel_booking_id)
+        class BookingFlow(FlowSpec):
+
+            @step
+            def book_hotel(self):
+                self.hotel_id = reserve_hotel()
+                self.next(self.book_flight)
+
+            @book_hotel.compensate
+            def cancel_hotel(self):
+                cancel_reservation(self.hotel_id)
     """
-    def decorator(fn):
-        fn._compensate_for_step = step
-        return fn
-    return decorator
+    from metaflow import step as _metaflow_step
+    wrapped = _metaflow_step(fn)
+    _step_name = fn.__name__
+
+    def compensate(handler_fn):
+        """Register handler_fn as the compensation for this step."""
+        handler_fn._compensate_for_step = _step_name
+        return handler_fn
+
+    wrapped.compensate = compensate
+    return wrapped

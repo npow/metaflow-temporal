@@ -197,11 +197,12 @@ processing) need a way to undo completed work when a later step fails. The Saga 
 this: each compensatable step declares a _compensation handler_ that runs automatically, in
 reverse order (LIFO), if the workflow fails.
 
-Import `compensate` from the extension and annotate compensation methods on your `FlowSpec`:
+Import `step` from the extension instead of Metaflow. It's a drop-in replacement that adds
+an optional `.compensate` decorator for declaring compensation handlers inline:
 
 ```python
-from metaflow import FlowSpec, step
-from metaflow_extensions.temporal.plugins.temporal import compensate
+from metaflow import FlowSpec
+from metaflow_extensions.temporal.plugins.temporal import step  # shadows metaflow.step
 
 class BookingFlow(FlowSpec):
 
@@ -214,10 +215,18 @@ class BookingFlow(FlowSpec):
         self.hotel_id = reserve_hotel()   # side effect
         self.next(self.book_flight)
 
+    @book_hotel.compensate
+    def cancel_hotel(self):
+        cancel_reservation(self.hotel_id) # self.hotel_id injected from forward step
+
     @step
     def book_flight(self):
         self.flight_id = reserve_flight() # side effect
         self.next(self.confirm)
+
+    @book_flight.compensate
+    def cancel_flight(self):
+        cancel_reservation(self.flight_id)
 
     @step
     def confirm(self):
@@ -226,31 +235,17 @@ class BookingFlow(FlowSpec):
     @step
     def end(self):
         pass
-
-    # Compensation handlers (NOT @step-decorated, no self.next())
-    @compensate("book_hotel")
-    def cancel_hotel(self):
-        cancel_reservation(self.hotel_id)   # self.hotel_id injected from forward step
-
-    @compensate("book_flight")
-    def cancel_flight(self):
-        cancel_reservation(self.flight_id)  # self.flight_id injected from forward step
 ```
 
 When `confirm` raises, the workflow automatically runs `cancel_flight` then `cancel_hotel`
 (reverse order), then re-raises the original error.
 
-**Decorator API**
+**API**
 
-```python
-@compensate("step_name")
-def handler_method(self):
-    ...
-```
-
-- `step_name`: the name of the `@step` method this compensation undoes.
+- Each compensatable step gets at most one `.compensate` handler — enforced structurally.
 - The handler receives the forward step's persisted artifacts as `self.<attr>`.
 - The handler must **not** call `self.next()`.
+- Non-saga steps use `@step` identically to plain Metaflow — no change needed.
 - Compensation failures are logged but do not cascade (best-effort execution).
 
 **Limitations (v1)**
