@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import sys
@@ -108,6 +109,10 @@ class Temporal:
             "project": self._project_info,
             # Workflow execution timeout in seconds (None = no limit)
             "workflow_timeout_seconds": self.workflow_timeout_seconds,
+            # Saga compensation map: {"step_name": "handler_method_name", ...}
+            "compensations": self._build_compensations(),
+            # Original Python class name (needed by run_compensation to importlib-load the class)
+            "flow_class_name": self.flow.__class__.__name__,
         }
 
     def _process_parameters(self) -> dict:
@@ -272,6 +277,14 @@ class Temporal:
             }
         except Exception:
             return None
+
+    def _build_compensations(self) -> dict:
+        """Scan the flow class for @compensate-decorated methods and return the mapping."""
+        compensations = {}
+        for name, method in inspect.getmembers(self.flow.__class__, predicate=inspect.isfunction):
+            if hasattr(method, "_compensate_for_step"):
+                compensations[method._compensate_for_step] = name
+        return compensations
 
     def _render_template(self, config: dict) -> str:
         try:

@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
     MetaflowWorkflow,
+    run_compensation,
     run_metaflow_step,
 )
 
@@ -43,7 +44,7 @@ async def worker(temporal_env):
         temporal_env.client,
         task_queue=task_queue,
         workflows=[MetaflowWorkflow],
-        activities=[run_metaflow_step],
+        activities=[run_metaflow_step, run_compensation],
         activity_executor=ThreadPoolExecutor(max_workers=8),
     ):
         yield temporal_env.client, task_queue

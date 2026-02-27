@@ -731,6 +731,136 @@ class TestConfigAndArtifacts:
 
 
 # ---------------------------------------------------------------------------
+# Saga / Compensation tests
+# ---------------------------------------------------------------------------
+
+_SAGA_LOG = "/tmp/saga_test_log.json"
+
+
+class TestSagaCompilation:
+    """Unit tests verifying that @compensate metadata is captured in CONFIG."""
+
+    def _compile_saga(self, tmp_path) -> dict:
+        import subprocess
+
+        out_file = str(tmp_path / "saga_worker.py")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(FLOWS_DIR / "saga_flow.py"),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+                "--task-queue", "test",
+                "--temporal-host", "localhost:7233",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            "temporal create failed:\nSTDOUT: %s\nSTDERR: %s" % (result.stdout, result.stderr)
+        )
+        return _extract_config_from_worker(out_file)
+
+    def test_compensations_in_config(self, tmp_path):
+        config = self._compile_saga(tmp_path)
+        assert "compensations" in config
+        assert config["compensations"] == {"book_a": "cancel_a", "book_b": "cancel_b"}
+
+    def test_flow_class_name_in_config(self, tmp_path):
+        config = self._compile_saga(tmp_path)
+        assert config.get("flow_class_name") == "SagaFlow"
+
+    def test_no_compensations_for_plain_flow(self, tmp_path):
+        import subprocess
+
+        out_file = str(tmp_path / "linear_worker.py")
+        subprocess.run(
+            [
+                sys.executable,
+                str(FLOWS_DIR / "linear_flow.py"),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        config = _extract_config_from_worker(out_file)
+        assert config.get("compensations") == {}
+
+
+class TestSagaExecution:
+    """End-to-end tests verifying saga compensation runs on failure."""
+
+    @pytest.mark.asyncio
+    async def test_compensation_runs_on_failure(self, worker):
+        """When fail_step raises, cancel_b then cancel_a should run (LIFO)."""
+        import json
+        import os
+
+        # Remove any stale log
+        if os.path.exists(_SAGA_LOG):
+            os.unlink(_SAGA_LOG)
+
+        client, task_queue = worker
+
+        with pytest.raises(Exception):
+            await _run_flow(
+                client,
+                task_queue,
+                FLOWS_DIR / "saga_flow.py",
+                "SagaFlow",
+                {},
+            )
+
+        # Both compensations should have run
+        assert os.path.exists(_SAGA_LOG), "Saga log not created — compensations did not run"
+        with open(_SAGA_LOG) as f:
+            log = json.load(f)
+
+        actions = [e["action"] for e in log]
+        assert "cancel_a" in actions, "cancel_a compensation did not run"
+        assert "cancel_b" in actions, "cancel_b compensation did not run"
+        # LIFO order: cancel_b runs before cancel_a
+        assert actions.index("cancel_b") < actions.index("cancel_a"), (
+            "Compensations did not run in LIFO order: %s" % actions
+        )
+        # Artifacts were injected correctly
+        cancel_b_entry = next(e for e in log if e["action"] == "cancel_b")
+        assert cancel_b_entry["booking_id"] == "flight-456"
+        cancel_a_entry = next(e for e in log if e["action"] == "cancel_a")
+        assert cancel_a_entry["booking_id"] == "hotel-123"
+
+    @pytest.mark.asyncio
+    async def test_no_compensation_on_success(self, worker):
+        """Successful flows must not write to the compensation log."""
+        import os
+
+        if os.path.exists(_SAGA_LOG):
+            os.unlink(_SAGA_LOG)
+
+        client, task_queue = worker
+        run_id = await _run_flow(
+            client,
+            task_queue,
+            FLOWS_DIR / "linear_flow.py",
+            "LinearFlow",
+            {},
+        )
+        assert run_id.startswith("temporal-")
+        assert not os.path.exists(_SAGA_LOG), "Compensation log written for successful flow"
+
+
+# ---------------------------------------------------------------------------
 # Tier 2: external Temporal server tests
 # ---------------------------------------------------------------------------
 

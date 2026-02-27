@@ -65,6 +65,20 @@ class StepOutput:
     artifact_fetch_hint: Optional[str] = None
 
 
+@dataclass
+class CompensationInput:
+    flow_file: str
+    flow_name: str          # project-aware name (for artifact pathspec lookup)
+    flow_class_name: str    # original Python class name (for importlib)
+    handler_name: str       # compensation method name
+    forward_step: str       # the step being compensated
+    run_id: str
+    task_id: str            # task_id of the forward step
+    metadata_type: str = "local"
+    datastore_type: str = "local"
+    datastore_root: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Activity
 # ---------------------------------------------------------------------------
@@ -276,6 +290,64 @@ async def run_metaflow_step(inp: StepInput) -> StepOutput:
             pass
 
 
+@activity.defn(name="run_compensation")
+async def run_compensation(inp: CompensationInput) -> None:
+    """Execute a saga compensation handler for a previously completed step.
+
+    Loads the forward step's artifacts via the Metaflow client, creates a
+    minimal flow instance with those artifacts injected, and calls the
+    compensation method.  Best-effort: caller should catch exceptions.
+    """
+    import importlib.util
+
+    root = inp.datastore_root or _datastore_root_arg({}, inp.datastore_type)
+    artifacts = {}
+
+    with _artifact_lock:
+        old = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
+        os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = root
+        try:
+            import metaflow
+            metaflow.metadata(inp.metadata_type)
+            pathspec = "%s/%s/%s/%s" % (
+                inp.flow_name,
+                inp.run_id,
+                inp.forward_step,
+                inp.task_id,
+            )
+            task = metaflow.Task(pathspec)
+            for a in task.artifacts:
+                if not a.id.startswith("_"):
+                    try:
+                        artifacts[a.id] = getattr(task.data, a.id)
+                    except Exception:
+                        pass
+        finally:
+            if old is None:
+                os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
+            else:
+                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old
+
+    # Load the flow module, create a bare instance, inject artifacts, call handler.
+    # We inject directly into __dict__ to bypass FlowSpec.__getattr__/__setattr__
+    # which may recurse if internal state (e.g. _datastore) is not initialised.
+    spec = importlib.util.spec_from_file_location("_comp_flow", inp.flow_file)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    flow_class = getattr(module, inp.flow_class_name)
+    instance = object.__new__(flow_class)
+    # Seed internal FlowSpec state to prevent __getattr__ recursion
+    instance.__dict__["_datastore"] = None
+    for k, v in artifacts.items():
+        instance.__dict__[k] = v
+    handler = getattr(instance, inp.handler_name)
+    loop = asyncio.get_event_loop()
+    if asyncio.iscoroutinefunction(handler):
+        await handler()
+    else:
+        await loop.run_in_executor(None, handler)
+
+
 # ---------------------------------------------------------------------------
 # Workflow
 # ---------------------------------------------------------------------------
@@ -289,6 +361,9 @@ class MetaflowWorkflow:
     The "config" key holds the compiled flow graph; "params" holds runtime params.
     """
 
+    def __init__(self):
+        self._compensation_stack: list = []
+
     @workflow.run
     async def run(self, args: dict) -> str:
         cfg = args["config"]
@@ -298,8 +373,40 @@ class MetaflowWorkflow:
     async def _execute_graph(self, cfg: dict, params: dict) -> str:
         run_id = "temporal-%s" % workflow.info().workflow_id[:20]
         task_ids: dict = {}
-        await self._execute_node("start", cfg, run_id, task_ids, params, -1)
-        return run_id
+        try:
+            await self._execute_node("start", cfg, run_id, task_ids, params, -1)
+            return run_id
+        except Exception:
+            if cfg.get("compensations") and self._compensation_stack:
+                await self._run_compensations(cfg, run_id)
+            raise
+
+    async def _run_compensations(self, cfg: dict, run_id: str) -> None:
+        """Run all queued compensations in LIFO order (best-effort)."""
+        for entry in reversed(self._compensation_stack):
+            try:
+                await workflow.execute_activity(
+                    run_compensation,
+                    CompensationInput(
+                        flow_file=cfg["flow_file"],
+                        flow_name=cfg["flow_name"],
+                        flow_class_name=cfg.get("flow_class_name", cfg["flow_name"]),
+                        handler_name=entry["handler"],
+                        forward_step=entry["step"],
+                        run_id=run_id,
+                        task_id=entry["task_id"],
+                        metadata_type=cfg.get("metadata_type", "local"),
+                        datastore_type=cfg.get("datastore_type", "local"),
+                        datastore_root=cfg.get("datastore_root", ""),
+                    ),
+                    start_to_close_timeout=timedelta(seconds=300),
+                    retry_policy=RetryPolicy(
+                        maximum_attempts=3,
+                        initial_interval=timedelta(seconds=5),
+                    ),
+                )
+            except Exception:
+                pass  # best-effort: log and continue
 
     async def _execute_node(
         self,
@@ -360,6 +467,15 @@ class MetaflowWorkflow:
         )
 
         task_ids[step_name] = out.task_id
+
+        # Push to saga compensation stack if this step has a registered compensation
+        compensations = cfg.get("compensations", {})
+        if step_name in compensations:
+            self._compensation_stack.append({
+                "handler": compensations[step_name],
+                "step": step_name,
+                "task_id": out.task_id,
+            })
 
         if step_name == "end":
             return
@@ -627,7 +743,7 @@ class WorkerUtils:
             client,
             task_queue=config["task_queue"],
             workflows=[MetaflowWorkflow],
-            activities=[run_metaflow_step],
+            activities=[run_metaflow_step, run_compensation],
             activity_executor=ThreadPoolExecutor(
                 max_workers=config.get("max_workers", 10)
             ),

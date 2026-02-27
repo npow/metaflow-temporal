@@ -190,6 +190,74 @@ Cap how long a single workflow execution may run before Temporal cancels it:
 python my_flow.py temporal create --output my_flow_worker.py --workflow-timeout 7200
 ```
 
+### Saga Pattern (Automatic Compensation)
+
+Long-running flows that touch external systems (hotel bookings, cloud provisioning, payment
+processing) need a way to undo completed work when a later step fails. The Saga pattern solves
+this: each compensatable step declares a _compensation handler_ that runs automatically, in
+reverse order (LIFO), if the workflow fails.
+
+Import `compensate` from the extension and annotate compensation methods on your `FlowSpec`:
+
+```python
+from metaflow import FlowSpec, step
+from metaflow_extensions.temporal.plugins.temporal import compensate
+
+class BookingFlow(FlowSpec):
+
+    @step
+    def start(self):
+        self.next(self.book_hotel)
+
+    @step
+    def book_hotel(self):
+        self.hotel_id = reserve_hotel()   # side effect
+        self.next(self.book_flight)
+
+    @step
+    def book_flight(self):
+        self.flight_id = reserve_flight() # side effect
+        self.next(self.confirm)
+
+    @step
+    def confirm(self):
+        raise RuntimeError("Payment declined")  # triggers compensations
+
+    @step
+    def end(self):
+        pass
+
+    # Compensation handlers (NOT @step-decorated, no self.next())
+    @compensate("book_hotel")
+    def cancel_hotel(self):
+        cancel_reservation(self.hotel_id)   # self.hotel_id injected from forward step
+
+    @compensate("book_flight")
+    def cancel_flight(self):
+        cancel_reservation(self.flight_id)  # self.flight_id injected from forward step
+```
+
+When `confirm` raises, the workflow automatically runs `cancel_flight` then `cancel_hotel`
+(reverse order), then re-raises the original error.
+
+**Decorator API**
+
+```python
+@compensate("step_name")
+def handler_method(self):
+    ...
+```
+
+- `step_name`: the name of the `@step` method this compensation undoes.
+- The handler receives the forward step's persisted artifacts as `self.<attr>`.
+- The handler must **not** call `self.next()`.
+- Compensation failures are logged but do not cascade (best-effort execution).
+
+**Limitations (v1)**
+
+- Compensations are tracked only for steps executed via the main linear path (`_execute_node`).
+  Steps inside `foreach` bodies and parallel split branches are not compensated.
+
 ## How it works
 
 `metaflow-temporal` compiles your flow's DAG into a self-contained worker file. Each Metaflow
