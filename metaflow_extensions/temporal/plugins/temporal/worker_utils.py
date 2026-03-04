@@ -48,9 +48,17 @@ class StepInput:
     environment_type: str = "local"
     event_logger_type: str = "nullSidecarLogger"
     monitor_type: str = "nullSidecarMonitor"
+    # Uploaded code package metadata (for remote runtime decorators that
+    # launch code in external backends).
+    code_package_url: str = ""
+    code_package_sha: str = ""
+    code_package_metadata: str = ""
     # Decorator backend specs forwarded as --with flags (e.g. "kubernetes:cpu=4",
     # "sandbox:backend=daytona", "conda:packages=['numpy']").
     decorator_specs: Optional[List[str]] = None
+    # Serialized initialized step decorators (compile-time snapshot) used to
+    # invoke runtime_step_cli hooks in this worker process.
+    runtime_cli_decorators: Optional[List[dict]] = None
     # Run tags forwarded as --tag flags to each step subprocess
     tags: Optional[List[str]] = None
 
@@ -116,20 +124,133 @@ def _top_level_args(inp: StepInput) -> list:
     return args
 
 
-def _build_step_cmd(inp: StepInput, input_paths: str) -> list:
-    top_level = _top_level_args(inp) + ["--with=temporal_internal"]
-    step_args = [
-        "step",
-        inp.step_name,
-        "--run-id", inp.run_id,
-        "--task-id", inp.task_id,
-        "--retry-count", str(inp.retry_count),
-        "--max-user-code-retries", str(inp.max_retries),
-        "--input-paths", input_paths,
-    ]
-    if inp.split_index >= 0:
-        step_args += ["--split-index", str(inp.split_index)]
-    return [sys.executable, inp.flow_file] + top_level + step_args
+class _RuntimeCLIArgs(object):
+    """Minimal CLIArgs shim for StepDecorator.runtime_step_cli hooks."""
+
+    def __init__(self, inp: StepInput, input_paths: str):
+        self.entrypoint = [sys.executable, inp.flow_file]
+        self.top_level_options = {
+            "quiet": True,
+            "pylint": False,
+            "metadata": inp.metadata_type,
+            "environment": inp.environment_type,
+            "datastore": inp.datastore_type,
+            "datastore-root": _datastore_root_arg(inp.env_overrides, inp.datastore_type),
+            "event-logger": inp.event_logger_type,
+            "monitor": inp.monitor_type,
+            "with": list(inp.decorator_specs or []) + ["temporal_internal"],
+            "tag": list(inp.tags or []),
+        }
+        self.commands = ["step"]
+        self.command_args = [inp.step_name]
+        self.command_options = {
+            "run-id": inp.run_id,
+            "task-id": inp.task_id,
+            "retry-count": inp.retry_count,
+            "max-user-code-retries": inp.max_retries,
+            "input-paths": input_paths,
+            "split-index": inp.split_index if inp.split_index >= 0 else None,
+        }
+        self.env = {}
+
+    def get_args(self) -> list:
+        def _options(mapping):
+            for k, v in mapping.items():
+                if v is None or v is False:
+                    continue
+                k = k.replace("_", "-")
+                values = v if isinstance(v, (list, tuple, set)) else [v]
+                for value in values:
+                    yield "--%s" % k
+                    if not isinstance(value, bool):
+                        yield str(value)
+
+        args = list(self.entrypoint)
+        args.extend(_options(self.top_level_options))
+        args.extend(self.commands)
+        args.extend(self.command_args)
+        args.extend(_options(self.command_options))
+        return args
+
+
+def _runtime_step_decorators(inp: StepInput) -> list:
+    """Resolve StepDecorator instances for runtime_step_cli hooks."""
+    try:
+        import importlib
+        from metaflow.decorators import StepDecorator, extract_step_decorator_from_decospec
+    except Exception:
+        return []
+
+    # Preferred path: use compile-time initialized decorator snapshots.
+    decorators = []
+    for snap in (inp.runtime_cli_decorators or []):
+        try:
+            module_name = snap.get("module")
+            class_name = snap.get("class")
+            if not module_name or not class_name:
+                continue
+            module = importlib.import_module(module_name)
+            deco_cls = getattr(module, class_name)
+            deco = deco_cls()
+            if not isinstance(deco, StepDecorator):
+                continue
+            state = snap.get("state", {})
+            if isinstance(state, dict):
+                deco.__dict__.update(state)
+            # Some decorators expect package pointers from runtime_init/task_created.
+            # Hydrate both class-level and instance-level fields when available.
+            for attr, value in (
+                ("package_url", inp.code_package_url),
+                ("package_sha", inp.code_package_sha),
+                ("package_metadata", inp.code_package_metadata),
+            ):
+                if value:
+                    try:
+                        setattr(deco.__class__, attr, value)
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(deco, attr, None) in (None, ""):
+                            setattr(deco, attr, value)
+                    except Exception:
+                        pass
+            decorators.append(deco)
+        except Exception:
+            continue
+    if decorators:
+        return decorators
+
+    # Fallback path: parse raw --with specs.
+    for spec in (inp.decorator_specs or []):
+        try:
+            deco, _ = extract_step_decorator_from_decospec(spec)
+            if isinstance(deco, StepDecorator):
+                deco.external_init()
+                decorators.append(deco)
+        except Exception:
+            # Unknown or unavailable decorator modules are already represented
+            # as --with flags; skip hook invocation and let CLI handle it.
+            continue
+    return decorators
+
+
+def _build_step_cmd(inp: StepInput, input_paths: str) -> tuple:
+    """Return (argv, extra_env) for a step execution."""
+    cli_args = _RuntimeCLIArgs(inp, input_paths)
+    for deco in _runtime_step_decorators(inp):
+        try:
+            deco.runtime_step_cli(
+                cli_args,
+                inp.retry_count,
+                inp.max_retries,
+                None,  # ubf_context
+            )
+        except Exception:
+            # Some decorators need additional runtime lifecycle hooks (e.g.
+            # runtime_init/runtime_task_created) before runtime_step_cli.
+            # Fall back to standard local step execution when unavailable.
+            continue
+    return cli_args.get_args(), dict(cli_args.env)
 
 
 def _build_init_cmd(inp: StepInput, params_task_id: str, params: dict) -> list:
@@ -250,11 +371,12 @@ async def run_metaflow_step(inp: StepInput) -> StepOutput:
 
             input_paths = "%s/_parameters/%s" % (inp.run_id, params_task_id)
 
+        step_cmd, step_env = _build_step_cmd(inp, input_paths)
         result = await loop.run_in_executor(
             None,
             lambda: subprocess.run(
-                _build_step_cmd(inp, input_paths),
-                env=env,
+                step_cmd,
+                env={**env, **step_env},
                 capture_output=True,
             ),
         )
@@ -263,8 +385,14 @@ async def run_metaflow_step(inp: StepInput) -> StepOutput:
             stderr = result.stderr.decode(errors="replace")
             stdout = result.stdout.decode(errors="replace")
             raise ApplicationError(
-                "Step %s failed (exit %d):\nSTDOUT: %s\nSTDERR: %s"
-                % (inp.step_name, result.returncode, stdout[-2000:], stderr[-2000:])
+                "Step %s failed (exit %d):\nCMD: %s\nSTDOUT: %s\nSTDERR: %s"
+                % (
+                    inp.step_name,
+                    result.returncode,
+                    " ".join(str(x) for x in step_cmd),
+                    stdout[-2000:],
+                    stderr[-2000:],
+                )
             )
 
         out = {}
@@ -423,11 +551,12 @@ class MetaflowWorkflow:
 
         input_paths = _resolve_input_paths(step_name, node, run_id, task_ids)
 
-        attempt = workflow.info().attempt
+        temporal_attempt = workflow.info().attempt
+        retry_count = max(0, temporal_attempt - 1)
         if split_index >= 0:
-            task_id = "temporal-%s-%d-%d" % (step_name, split_index, attempt)
+            task_id = "temporal-%s-%d-%d" % (step_name, split_index, retry_count)
         else:
-            task_id = "temporal-%s-%d" % (step_name, attempt)
+            task_id = "temporal-%s-%d" % (step_name, retry_count)
 
         env_overrides = dict(node.get("env", {}))
         env_overrides["METAFLOW_RUN_ID"] = run_id
@@ -439,7 +568,7 @@ class MetaflowWorkflow:
             run_id=run_id,
             task_id=task_id,
             input_paths=input_paths,
-            retry_count=attempt,
+            retry_count=retry_count,
             max_retries=node.get("retries", 0),
             split_index=split_index,
             env_overrides=env_overrides,
@@ -449,7 +578,11 @@ class MetaflowWorkflow:
             environment_type=cfg.get("environment_type", "local"),
             event_logger_type=cfg.get("event_logger_type", "nullSidecarLogger"),
             monitor_type=cfg.get("monitor_type", "nullSidecarMonitor"),
+            code_package_url=(cfg.get("code_package") or {}).get("url", ""),
+            code_package_sha=(cfg.get("code_package") or {}).get("sha", ""),
+            code_package_metadata=(cfg.get("code_package") or {}).get("metadata", ""),
             decorator_specs=node.get("decorator_specs", []),
+            runtime_cli_decorators=node.get("runtime_cli_decorators", []),
             tags=cfg.get("tags", []),
         )
 
@@ -490,7 +623,9 @@ class MetaflowWorkflow:
             # Run all body steps in parallel
             body_results = await asyncio.gather(
                 *[
-                    self._execute_foreach_body(body_step, cfg, run_id, params, i, attempt)
+                    self._execute_foreach_body(
+                        body_step, cfg, run_id, params, i, retry_count
+                    )
                     for i in range(cardinality)
                 ]
             )
@@ -511,7 +646,7 @@ class MetaflowWorkflow:
             branch_results = await asyncio.gather(
                 *[
                     self._execute_branch_until_join(
-                        branch, cfg, run_id, params, attempt, dict(shared_ids)
+                        branch, cfg, run_id, params, retry_count, dict(shared_ids)
                     )
                     for branch in out_funcs
                 ]
@@ -536,7 +671,7 @@ class MetaflowWorkflow:
         run_id: str,
         params: dict,
         split_index: int,
-        attempt: int,
+        retry_count: int,
     ) -> StepOutput:
         """Execute a single foreach body step."""
         steps = cfg["steps"]
@@ -544,10 +679,10 @@ class MetaflowWorkflow:
 
         # For foreach body, parent is the foreach step
         parent_step = node["in_funcs"][0]
-        parent_task_id = "temporal-%s-%d" % (parent_step, attempt)
+        parent_task_id = "temporal-%s-%d" % (parent_step, retry_count)
         input_paths = "%s/%s/%s" % (run_id, parent_step, parent_task_id)
 
-        task_id = "temporal-%s-%d-%d" % (step_name, split_index, attempt)
+        task_id = "temporal-%s-%d-%d" % (step_name, split_index, retry_count)
         env_overrides = dict(node.get("env", {}))
         env_overrides["METAFLOW_RUN_ID"] = run_id
 
@@ -558,7 +693,7 @@ class MetaflowWorkflow:
             run_id=run_id,
             task_id=task_id,
             input_paths=input_paths,
-            retry_count=attempt,
+            retry_count=retry_count,
             max_retries=node.get("retries", 0),
             split_index=split_index,
             env_overrides=env_overrides,
@@ -568,7 +703,11 @@ class MetaflowWorkflow:
             environment_type=cfg.get("environment_type", "local"),
             event_logger_type=cfg.get("event_logger_type", "nullSidecarLogger"),
             monitor_type=cfg.get("monitor_type", "nullSidecarMonitor"),
+            code_package_url=(cfg.get("code_package") or {}).get("url", ""),
+            code_package_sha=(cfg.get("code_package") or {}).get("sha", ""),
+            code_package_metadata=(cfg.get("code_package") or {}).get("metadata", ""),
             decorator_specs=node.get("decorator_specs", []),
+            runtime_cli_decorators=node.get("runtime_cli_decorators", []),
             tags=cfg.get("tags", []),
         )
 
@@ -591,7 +730,7 @@ class MetaflowWorkflow:
         cfg: dict,
         run_id: str,
         params: dict,
-        attempt: int,
+        retry_count: int,
         task_ids: dict = None,
     ) -> dict:
         """Execute a branch from step_name until it reaches a join node.
@@ -616,7 +755,7 @@ class MetaflowWorkflow:
             # We need to look at in_funcs and find what's already in task_ids
             # _resolve_input_paths handles this via the passed task_ids
 
-            task_id = "temporal-%s-%d" % (current, attempt)
+            task_id = "temporal-%s-%d" % (current, retry_count)
             env_overrides = dict(node.get("env", {}))
             env_overrides["METAFLOW_RUN_ID"] = run_id
 
@@ -627,7 +766,7 @@ class MetaflowWorkflow:
                 run_id=run_id,
                 task_id=task_id,
                 input_paths=input_paths,
-                retry_count=attempt,
+                retry_count=retry_count,
                 max_retries=node.get("retries", 0),
                 split_index=-1,
                 env_overrides=env_overrides,
@@ -637,7 +776,11 @@ class MetaflowWorkflow:
                 environment_type=cfg.get("environment_type", "local"),
                 event_logger_type=cfg.get("event_logger_type", "nullSidecarLogger"),
                 monitor_type=cfg.get("monitor_type", "nullSidecarMonitor"),
+                code_package_url=(cfg.get("code_package") or {}).get("url", ""),
+                code_package_sha=(cfg.get("code_package") or {}).get("sha", ""),
+                code_package_metadata=(cfg.get("code_package") or {}).get("metadata", ""),
                 decorator_specs=node.get("decorator_specs", []),
+                runtime_cli_decorators=node.get("runtime_cli_decorators", []),
             )
 
             retry_policy = RetryPolicy(maximum_attempts=node.get("retries", 0) + 1)

@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Optional
 
 from metaflow.exception import MetaflowException
+from metaflow.decorators import StepDecorator
 
 try:
     from metaflow.plugins.timeout_decorator import get_run_time_limit_for_task
@@ -68,6 +69,7 @@ class Temporal:
         self.task_queue = task_queue or (
             "metaflow-%s" % effective_name.lower().replace(".", "-")
         )
+        self._code_package_info = None
 
     def compile(self) -> str:
         config = self._build_config()
@@ -113,7 +115,34 @@ class Temporal:
             "compensations": self._build_compensations(),
             # Original Python class name (needed by run_compensation to importlib-load the class)
             "flow_class_name": self.flow.__class__.__name__,
+            # Uploaded code package metadata for remote runtime decorators
+            # (e.g. sandbox/daytona/e2b, batch, kubernetes).
+            "code_package": self._get_code_package_info(),
         }
+
+    def _get_code_package_info(self) -> Optional[dict]:
+        if self._code_package_info is not None:
+            return self._code_package_info
+        try:
+            from metaflow.package import MetaflowPackage
+
+            package = MetaflowPackage(
+                self.flow,
+                self.environment,
+                echo=lambda *args, **kwargs: None,
+                flow_datastore=self.flow_datastore,
+            )
+            package_url, package_sha = self.flow_datastore.save_data(
+                [package.blob], len_hint=1
+            )[0]
+            self._code_package_info = {
+                "url": package_url,
+                "sha": package_sha,
+                "metadata": package.package_metadata,
+            }
+        except Exception:
+            self._code_package_info = None
+        return self._code_package_info
 
     def _process_parameters(self) -> dict:
         """Extract flow parameters."""
@@ -147,25 +176,90 @@ class Temporal:
                 # Decorator backend specs, e.g. ["kubernetes:image=python:3.11,cpu=2"].
                 # Forwarded as --with=<spec> flags to the step subprocess.
                 "decorator_specs": self._get_decorator_specs(node),
+                # Serialized initialized decorator state used to invoke
+                # runtime_step_cli hooks in the worker process.
+                "runtime_cli_decorators": self._get_runtime_cli_decorators(node),
             }
         return steps
+
+    def _iter_step_decorators(self, node) -> list:
+        step_obj = getattr(self.flow, node.name, None)
+        all_decorators = list(getattr(node, "decorators", []) or [])
+        if step_obj is not None:
+            all_decorators.extend(getattr(step_obj, "wrappers", []) or [])
+            all_decorators.extend(getattr(step_obj, "config_decorators", []) or [])
+        return all_decorators
 
     def _get_decorator_specs(self, node) -> list:
         """Return --with-compatible spec strings for user-defined step decorators."""
         specs = []
-        for d in node.decorators:
-            if d.name in ("temporal_internal",):
+        seen = set()
+        for d in self._iter_step_decorators(node):
+            name = getattr(d, "name", None)
+            if not name:
                 continue
-            if d.name in ("retry", "timeout", "environment", "project", "trigger",
-                          "trigger_on_finish", "schedule", "card"):
+            if name in ("temporal_internal",):
+                continue
+            if name in ("retry", "timeout", "environment", "project", "trigger",
+                        "trigger_on_finish", "schedule", "card"):
                 continue
             try:
                 spec = d.make_decorator_spec()
-                if spec:
+                if spec and spec not in seen:
+                    seen.add(spec)
                     specs.append(spec)
             except Exception:
                 pass
         return specs
+
+    def _get_runtime_cli_decorators(self, node) -> list:
+        """Serialize initialized decorator objects that override runtime_step_cli."""
+        snapshots = []
+        seen = set()
+        skip_state_keys = {
+            "flow",
+            "graph",
+            "package",
+            "metadata",
+            "task_datastore",
+            "flow_datastore",
+            "logger",
+            "echo",
+        }
+        for d in self._iter_step_decorators(node):
+            name = getattr(d, "name", None)
+            if not name or name == "temporal_internal":
+                continue
+            try:
+                if d.__class__.runtime_step_cli is StepDecorator.runtime_step_cli:
+                    continue
+            except Exception:
+                continue
+
+            key = (d.__class__.__module__, d.__class__.__name__, name)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            state = {}
+            for k, v in getattr(d, "__dict__", {}).items():
+                if k in skip_state_keys:
+                    continue
+                try:
+                    json.dumps(v)
+                except Exception:
+                    continue
+                state[k] = v
+
+            snapshots.append(
+                {
+                    "name": name,
+                    "module": d.__class__.__module__,
+                    "class": d.__class__.__name__,
+                    "state": state,
+                }
+            )
+        return snapshots
 
     def _step_env(self, node) -> dict:
         """Build METAFLOW_* env vars needed at step execution time."""
