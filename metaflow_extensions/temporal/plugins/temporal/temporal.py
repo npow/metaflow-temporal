@@ -2,6 +2,7 @@ import inspect
 import json
 import os
 import sys
+import warnings
 from datetime import datetime
 from typing import Optional
 
@@ -14,7 +15,7 @@ except ImportError:
     get_run_time_limit_for_task = None
 
 from . import worker_utils
-from .exception import TemporalException
+from .exception import NotSupportedException, TemporalException
 
 WORKER_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "worker_template.mustache")
 
@@ -72,8 +73,28 @@ class Temporal:
         self._code_package_info = None
 
     def compile(self) -> str:
+        self._validate()
         config = self._build_config()
         return self._render_template(config)
+
+    def _validate(self) -> None:
+        """Validate the graph before compilation, raising errors for unsupported patterns."""
+        for node in self.graph:
+            for deco in node.decorators:
+                if deco.name == "condition":
+                    raise NotSupportedException(
+                        "Step *%s* uses @condition which is not supported with Temporal. "
+                        "Conditional branching via @condition produces incorrect generated "
+                        "code and must be removed." % node.name
+                    )
+                if deco.name == "resources":
+                    warnings.warn(
+                        "Step *%s* uses @resources. Resource requirements are passed through "
+                        "as decorator specs but are not enforced by Temporal scheduling — "
+                        "configure resources on your Temporal worker directly." % node.name,
+                        UserWarning,
+                        stacklevel=2,
+                    )
 
     def _build_config(self) -> dict:
         datastore_root = getattr(self.flow_datastore, "datastore_root", None) or ""

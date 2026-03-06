@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -54,6 +55,12 @@ def temporal(obj):
     type=int,
     help="Maximum seconds a workflow execution may run (default: no limit)",
 )
+@click.option(
+    "--deployer-attribute-file",
+    default=None,
+    hidden=True,
+    help="Write deployment info JSON here (used by Metaflow Deployer API).",
+)
 def create(
     obj,
     output,
@@ -65,6 +72,7 @@ def create(
     branch,
     production,
     workflow_timeout,
+    deployer_attribute_file,
 ):
     flow_name = obj.graph.name
     if output is None:
@@ -105,3 +113,114 @@ def create(
         click.echo("Flow name (in datastore): %s" % t._project_info["flow_name"])
     click.echo("Start worker:  python %s" % output)
     click.echo("Trigger run:   python %s trigger [key=value ...]" % output)
+
+    if deployer_attribute_file:
+        with open(deployer_attribute_file, "w") as f:
+            json.dump(
+                {
+                    "name": flow_name,
+                    "worker_file": os.path.abspath(output),
+                    "task_queue": t.task_queue,
+                    "temporal_host": temporal_host,
+                    "metadata": "{}",
+                },
+                f,
+            )
+
+
+@temporal.command(help="Trigger a run for a previously compiled Temporal worker.")
+@click.pass_obj
+@click.option("--name", default=None, help="Flow name (defaults to graph name)")
+@click.option(
+    "--task-queue", default=None, help="Temporal task queue name"
+)
+@click.option(
+    "--temporal-host",
+    default="localhost:7233",
+    show_default=True,
+    help="Temporal server host:port",
+)
+@click.option(
+    "--workflow-timeout",
+    default=None,
+    type=int,
+    help="Maximum seconds a workflow execution may run (default: no limit)",
+)
+@click.option(
+    "--deployer-attribute-file",
+    default=None,
+    hidden=True,
+    help="Write triggered-run info JSON here (used by Metaflow Deployer API).",
+)
+@click.option(
+    "--run-param",
+    "run_params",
+    multiple=True,
+    default=None,
+    help="Flow parameter as key=value (repeatable).",
+)
+def trigger(
+    obj,
+    name,
+    task_queue,
+    temporal_host,
+    workflow_timeout,
+    deployer_attribute_file,
+    run_params,
+):
+    """Trigger a Temporal workflow run and write run info for the Deployer API."""
+    import asyncio
+    import uuid
+    from datetime import timedelta
+
+    flow_name = name or obj.graph.name
+    if task_queue is None:
+        task_queue = "metaflow-%s" % flow_name.lower().replace(".", "-")
+
+    params = {}
+    for kv in run_params:
+        k, _, v = kv.partition("=")
+        params[k.strip()] = v.strip()
+
+    # Build a minimal config so we can trigger directly via the Temporal client.
+    # The worker must already be running; we only need to submit the workflow.
+    async def _trigger():
+        from temporalio.client import Client
+
+        client = await Client.connect(temporal_host)
+        workflow_id = "%s-%s" % (flow_name.lower(), uuid.uuid4().hex[:8])
+        timeout_seconds = workflow_timeout
+        execution_timeout = timedelta(seconds=timeout_seconds) if timeout_seconds else None
+
+        # We submit directly — the worker on the queue will process this.
+        # Build a minimal config dict: the worker already has the full config
+        # baked in, but we need to pass params to the workflow. The worker's
+        # MetaflowWorkflow.run() expects {"config": ..., "params": ...}.
+        # When triggering from the CLI we rely on the worker's embedded CONFIG.
+        # Send a sentinel so the worker uses its own embedded config.
+        handle = await client.start_workflow(
+            "MetaflowWorkflow",
+            {"config": None, "params": params, "_use_embedded_config": True},
+            id=workflow_id,
+            task_queue=task_queue,
+            execution_timeout=execution_timeout,
+        )
+        run_id = "temporal-%s" % workflow_id
+        return run_id, workflow_id
+
+    run_id, workflow_id = asyncio.run(_trigger())
+    pathspec = "%s/%s" % (flow_name, run_id)
+
+    click.echo("Triggered Temporal workflow: %s (pathspec: %s)" % (workflow_id, pathspec))
+
+    if deployer_attribute_file:
+        with open(deployer_attribute_file, "w") as f:
+            json.dump(
+                {
+                    "pathspec": pathspec,
+                    "name": flow_name,
+                    "workflow_id": workflow_id,
+                    "metadata": "{}",
+                },
+                f,
+            )

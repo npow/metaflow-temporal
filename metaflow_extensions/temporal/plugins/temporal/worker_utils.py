@@ -620,17 +620,33 @@ class MetaflowWorkflow:
             body_step = out_funcs[0]
             cardinality = out.foreach_cardinality
 
-            # Run all body steps in parallel
-            body_results = await asyncio.gather(
+            # Run all body steps in parallel; each slice gets its own task_ids
+            # snapshot so nested foreach can accumulate task_ids independently.
+            body_task_ids_list = await asyncio.gather(
                 *[
-                    self._execute_foreach_body(
-                        body_step, cfg, run_id, params, i, retry_count
+                    self._execute_foreach_slice(
+                        body_step, cfg, run_id, params, i, retry_count, dict(task_ids)
                     )
                     for i in range(cardinality)
                 ]
             )
-            split_task_ids = [r.task_id for r in body_results]
-            task_ids[body_step] = split_task_ids
+
+            # Collect the body-step task_ids from each slice for the join's
+            # input_paths.  body_task_ids_list[i] is the task_ids dict for
+            # slice i; the body_step key holds that slice's task_id string.
+            split_task_ids = [
+                slice_ids[body_step]
+                for slice_ids in body_task_ids_list
+                if not isinstance(slice_ids.get(body_step), list)
+            ]
+            # Flatten list entries (shouldn't occur at this level, but be safe)
+            flat_split_task_ids = []
+            for tid in [slice_ids.get(body_step) for slice_ids in body_task_ids_list]:
+                if isinstance(tid, list):
+                    flat_split_task_ids.extend(tid)
+                else:
+                    flat_split_task_ids.append(tid)
+            task_ids[body_step] = flat_split_task_ids
 
             # Continue to join
             body_node = steps[body_step]
@@ -664,7 +680,7 @@ class MetaflowWorkflow:
             for next_step in node["out_funcs"]:
                 await self._execute_node(next_step, cfg, run_id, task_ids, params, -1)
 
-    async def _execute_foreach_body(
+    async def _execute_foreach_slice(
         self,
         step_name: str,
         cfg: dict,
@@ -672,15 +688,30 @@ class MetaflowWorkflow:
         params: dict,
         split_index: int,
         retry_count: int,
-    ) -> StepOutput:
-        """Execute a single foreach body step."""
+        task_ids: dict,
+    ) -> dict:
+        """Execute one slice of a foreach body, handling arbitrary nesting depth.
+
+        Runs ``step_name`` as a Temporal activity with the given ``split_index``,
+        then — if that step is itself a foreach — recursively fans out its body
+        steps in parallel.  Returns the accumulated ``task_ids`` dict for this
+        slice so the caller can build the join's input_paths.
+        """
         steps = cfg["steps"]
         node = steps[step_name]
+        node_type = node["type"]
 
-        # For foreach body, parent is the foreach step
+        # Resolve input_paths for this slice.  The parent foreach step's
+        # task_id is already in task_ids (single string, not a list).
         parent_step = node["in_funcs"][0]
-        parent_task_id = "temporal-%s-%d" % (parent_step, retry_count)
-        input_paths = "%s/%s/%s" % (run_id, parent_step, parent_task_id)
+        parent_task_id = task_ids.get(parent_step, "temporal-%s-%d" % (parent_step, retry_count))
+        if isinstance(parent_task_id, list):
+            # Should not happen at the first body level, but handle gracefully
+            input_paths = ",".join(
+                "%s/%s/%s" % (run_id, parent_step, tid) for tid in parent_task_id
+            )
+        else:
+            input_paths = "%s/%s/%s" % (run_id, parent_step, parent_task_id)
 
         task_id = "temporal-%s-%d-%d" % (step_name, split_index, retry_count)
         env_overrides = dict(node.get("env", {}))
@@ -717,12 +748,55 @@ class MetaflowWorkflow:
         )
         timeout_seconds = node.get("timeout_seconds", 3600)
 
-        return await workflow.execute_activity(
+        out: StepOutput = await workflow.execute_activity(
             run_metaflow_step,
             inp,
             start_to_close_timeout=timedelta(seconds=timeout_seconds),
             retry_policy=retry_policy,
         )
+
+        # Record this step's task_id in the slice-local task_ids
+        task_ids[step_name] = out.task_id
+
+        if node_type == "foreach":
+            # Nested foreach: fan out the inner body steps in parallel
+            inner_out_funcs = node["out_funcs"]
+            if len(inner_out_funcs) != 1:
+                raise ApplicationError("foreach node must have exactly one out_func")
+            inner_body_step = inner_out_funcs[0]
+            inner_cardinality = out.foreach_cardinality
+
+            inner_task_ids_list = await asyncio.gather(
+                *[
+                    self._execute_foreach_slice(
+                        inner_body_step,
+                        cfg,
+                        run_id,
+                        params,
+                        inner_split_index,
+                        retry_count,
+                        dict(task_ids),
+                    )
+                    for inner_split_index in range(inner_cardinality)
+                ]
+            )
+
+            # Aggregate inner body task_ids for the inner join
+            flat_inner_task_ids = []
+            for inner_slice_ids in inner_task_ids_list:
+                tid = inner_slice_ids.get(inner_body_step)
+                if isinstance(tid, list):
+                    flat_inner_task_ids.extend(tid)
+                else:
+                    flat_inner_task_ids.append(tid)
+            task_ids[inner_body_step] = flat_inner_task_ids
+
+            # Execute the inner join step
+            inner_body_node = steps[inner_body_step]
+            inner_join_step = inner_body_node["out_funcs"][0]
+            await self._execute_node(inner_join_step, cfg, run_id, task_ids, params, -1)
+
+        return task_ids
 
     async def _execute_branch_until_join(
         self,
