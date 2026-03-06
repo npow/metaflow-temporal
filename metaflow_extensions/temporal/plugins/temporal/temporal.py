@@ -15,7 +15,7 @@ except ImportError:
     get_run_time_limit_for_task = None
 
 from . import worker_utils
-from .exception import NotSupportedException, TemporalException
+from .exception import TemporalException
 
 WORKER_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "worker_template.mustache")
 
@@ -81,12 +81,6 @@ class Temporal:
         """Validate the graph before compilation, raising errors for unsupported patterns."""
         for node in self.graph:
             for deco in node.decorators:
-                if deco.name == "condition":
-                    raise NotSupportedException(
-                        "Step *%s* uses @condition which is not supported with Temporal. "
-                        "Conditional branching via @condition produces incorrect generated "
-                        "code and must be removed." % node.name
-                    )
                 if deco.name == "resources":
                     warnings.warn(
                         "Step *%s* uses @resources. Resource requirements are passed through "
@@ -190,6 +184,10 @@ class Temporal:
                 "in_funcs": list(node.in_funcs),
                 "split_parents": list(node.split_parents),
                 "foreach_param": getattr(node, "foreach_param", None),
+                # For split-switch nodes: the condition variable name (string).
+                # The worker reads _transition from the datastore after the step runs
+                # to determine which single branch was chosen at runtime.
+                "condition": getattr(node, "condition", None),
                 "env": self._step_env(node),
                 "timeout_seconds": self._get_timeout(node),
                 "retries": self._get_retries(node),

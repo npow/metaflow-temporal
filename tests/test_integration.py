@@ -633,6 +633,134 @@ class TestConditionalFlow:
         assert any("15 >= 5" in r for r in results)
 
 
+class TestSwitchFlow:
+    """Tests for split-switch (condition=) conditional branching.
+
+    A split-switch runs EXACTLY ONE branch at runtime based on the value of a
+    condition variable.  The merge step (a regular linear step) receives input
+    from only the branch that ran.
+    """
+
+    @pytest.mark.asyncio
+    async def test_switch_flow_high_branch_completes(self, worker):
+        """Default value=10 > 5 → high branch runs."""
+        client, task_queue = worker
+        run_id = await _run_flow(
+            client,
+            task_queue,
+            FLOWS_DIR / "switch_flow.py",
+            "SwitchFlow",
+            {},  # value defaults to 10
+        )
+        assert run_id.startswith("temporal-")
+
+    @pytest.mark.asyncio
+    async def test_switch_flow_only_high_branch_ran(self, worker):
+        """With value=10 (> 5), only the high branch should have a task."""
+        client, task_queue = worker
+        run_id = await _run_flow(
+            client,
+            task_queue,
+            FLOWS_DIR / "switch_flow.py",
+            "SwitchFlow",
+            {},
+        )
+        run = metaflow.Run("SwitchFlow/%s" % run_id)
+        step_names = {s.id for s in run}
+        # high ran, low did NOT run
+        assert "high" in step_names
+        assert "low" not in step_names
+        assert "merge" in step_names
+        assert run["merge"].task.data.result == "high: 10 > 5"
+
+    @pytest.mark.asyncio
+    async def test_switch_flow_low_branch(self, worker):
+        """With value=3 (<= 5), only the low branch should run."""
+        client, task_queue = worker
+        run_id = await _run_flow(
+            client,
+            task_queue,
+            FLOWS_DIR / "switch_flow.py",
+            "SwitchFlow",
+            {"value": "3"},
+        )
+        run = metaflow.Run("SwitchFlow/%s" % run_id)
+        step_names = {s.id for s in run}
+        assert "low" in step_names
+        assert "high" not in step_names
+        assert run["merge"].task.data.result == "low: 3 <= 5"
+
+    @pytest.mark.asyncio
+    async def test_switch_flow_merge_artifact(self, worker):
+        """The merge step should see the artifact from the branch that ran."""
+        client, task_queue = worker
+        run_id = await _run_flow(
+            client,
+            task_queue,
+            FLOWS_DIR / "switch_flow.py",
+            "SwitchFlow",
+            {"value": "7"},
+        )
+        run = metaflow.Run("SwitchFlow/%s" % run_id)
+        result = run["merge"].task.data.result
+        assert "high" in result
+        assert "7" in result
+
+
+class TestSwitchFlowCompilation:
+    """Unit tests verifying that split-switch CONFIG is generated correctly."""
+
+    def test_switch_flow_config_has_split_switch_type(self, tmp_path):
+        import subprocess
+
+        out_file = str(tmp_path / "switch_worker.py")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(FLOWS_DIR / "switch_flow.py"),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        config = _extract_config_from_worker(out_file)
+        assert config["steps"]["start"]["type"] == "split-switch"
+        assert config["steps"]["start"]["condition"] == "category"
+        assert set(config["steps"]["start"]["out_funcs"]) == {"high", "low"}
+
+    def test_switch_flow_config_merge_has_multiple_in_funcs(self, tmp_path):
+        import subprocess
+
+        out_file = str(tmp_path / "switch_worker.py")
+        subprocess.run(
+            [
+                sys.executable,
+                str(FLOWS_DIR / "switch_flow.py"),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        config = _extract_config_from_worker(out_file)
+        # merge step is linear type with both branches as in_funcs
+        merge = config["steps"]["merge"]
+        assert merge["type"] == "linear"
+        assert set(merge["in_funcs"]) == {"high", "low"}
+
+
 class TestConfigAndArtifacts:
     """Tests for flow Parameters (config) and artifact persistence."""
 

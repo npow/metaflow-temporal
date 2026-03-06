@@ -71,6 +71,10 @@ class StepOutput:
     # See artifact_fetch_hint for a Python snippet to retrieve them.
     artifact_names: Optional[List[str]] = None
     artifact_fetch_hint: Optional[str] = None
+    # For split-switch nodes: the branch name chosen at runtime.
+    # Set by run_metaflow_step after reading the _transition artifact from
+    # the Metaflow datastore.  None for all non-switch steps.
+    chosen_branch: Optional[str] = None
 
 
 @dataclass
@@ -320,6 +324,47 @@ def _read_artifact_names(inp: StepInput) -> list:
         return []
 
 
+def _read_transition(inp: StepInput) -> Optional[str]:
+    """Read the ``_transition`` artifact written by a split-switch step.
+
+    Metaflow records ``self._transition = ([chosen_step_name], None)`` during
+    step execution so the runtime knows which single branch was taken.  We
+    retrieve it here using the Metaflow client so the workflow can skip all
+    other branches.
+
+    Returns the chosen step name, or ``None`` if the artifact cannot be read
+    (e.g. the step is not a split-switch, or reading fails for any reason).
+    """
+    try:
+        import metaflow
+
+        datastore_root = _datastore_root_arg(inp.env_overrides)
+        pathspec = "%s/%s/%s/%s" % (
+            inp.flow_name,
+            inp.run_id,
+            inp.step_name,
+            inp.task_id,
+        )
+        with _artifact_lock:
+            old = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
+            os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = datastore_root
+            try:
+                metaflow.metadata(inp.metadata_type)
+                task = metaflow.Task(pathspec)
+                transition = task["_transition"].data
+                # transition is a tuple: ([step_name], foreach_info_or_None)
+                if transition and isinstance(transition, (tuple, list)) and transition[0]:
+                    return transition[0][0]
+            finally:
+                if old is None:
+                    os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
+                else:
+                    os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old
+    except Exception:
+        pass
+    return None
+
+
 @activity.defn(name="run_metaflow_step")
 async def run_metaflow_step(inp: StepInput) -> StepOutput:
     """Execute a single Metaflow step as a Temporal activity."""
@@ -402,6 +447,11 @@ async def run_metaflow_step(inp: StepInput) -> StepOutput:
 
         artifact_names = _read_artifact_names(inp)
 
+        # For split-switch steps, read _transition to discover which branch was
+        # chosen at runtime.  This is done here (in the activity) rather than in
+        # workflow code so that we stay within Temporal's deterministic sandbox.
+        chosen_branch = _read_transition(inp)
+
         return StepOutput(
             task_id=inp.task_id,
             foreach_cardinality=out.get("foreach_cardinality", 0),
@@ -410,6 +460,7 @@ async def run_metaflow_step(inp: StepInput) -> StepOutput:
                 "import metaflow; t = metaflow.Task('%s/%s/%s/%s'); t.data.<name>"
                 % (inp.flow_name, inp.run_id, inp.step_name, inp.task_id)
             ) if artifact_names else None,
+            chosen_branch=chosen_branch,
         )
     finally:
         try:
@@ -549,7 +600,7 @@ class MetaflowWorkflow:
         node = steps[step_name]
         node_type = node["type"]
 
-        input_paths = _resolve_input_paths(step_name, node, run_id, task_ids)
+        input_paths = _resolve_input_paths(step_name, node, run_id, task_ids, steps=steps)
 
         temporal_attempt = workflow.info().attempt
         retry_count = max(0, temporal_attempt - 1)
@@ -652,6 +703,32 @@ class MetaflowWorkflow:
             body_node = steps[body_step]
             join_step = body_node["out_funcs"][0]
             await self._execute_node(join_step, cfg, run_id, task_ids, params, -1)
+
+        elif node_type == "split-switch":
+            # Only one branch runs at runtime.  The run_metaflow_step activity
+            # already read _transition from the datastore and put the chosen
+            # branch name in out.chosen_branch.
+            chosen_branch = out.chosen_branch
+
+            if chosen_branch is None:
+                # Fallback: if _transition could not be read, run the first branch.
+                chosen_branch = node["out_funcs"][0] if node["out_funcs"] else None
+
+            if chosen_branch:
+                # Execute only the chosen branch step(s) until we reach the merge
+                # point.  The merge step is a regular linear step (not a join type).
+                merge_step = _find_switch_merge_step(step_name, steps)
+                branch_task_ids = await self._execute_branch_until_switch_merge(
+                    chosen_branch, cfg, run_id, params, retry_count,
+                    dict(task_ids), merge_step,
+                )
+                task_ids.update(branch_task_ids)
+
+            # Execute the merge step (the linear step where branches converge).
+            # _resolve_input_paths will skip the non-executed branch's input path.
+            merge_step = _find_switch_merge_step(step_name, steps)
+            if merge_step:
+                await self._execute_node(merge_step, cfg, run_id, task_ids, params, -1)
 
         elif node_type == "split":
             out_funcs = node["out_funcs"]
@@ -824,7 +901,7 @@ class MetaflowWorkflow:
             if node_type == "join":
                 break
 
-            input_paths = _resolve_input_paths(current, node, run_id, task_ids)
+            input_paths = _resolve_input_paths(current, node, run_id, task_ids, steps=steps)
             # For the first step after a split, parent is the split step
             # We need to look at in_funcs and find what's already in task_ids
             # _resolve_input_paths handles this via the passed task_ids
@@ -879,6 +956,95 @@ class MetaflowWorkflow:
 
         return task_ids
 
+    async def _execute_branch_until_switch_merge(
+        self,
+        step_name: str,
+        cfg: dict,
+        run_id: str,
+        params: dict,
+        retry_count: int,
+        task_ids: dict,
+        merge_step: Optional[str],
+    ) -> dict:
+        """Execute one branch of a split-switch until it reaches the merge step.
+
+        Unlike ``_execute_branch_until_join``, the stopping condition is the
+        named ``merge_step`` (a regular linear step, not a ``join`` type) rather
+        than any node of type ``join``.  The merge step itself is NOT executed
+        here — the caller handles that after all (one) branch has finished.
+
+        Returns the accumulated ``task_ids`` dict for this branch.
+        """
+        steps = cfg["steps"]
+        current = step_name
+
+        while current is not None:
+            # Stop when we reach the merge step — caller will execute it
+            if current == merge_step:
+                break
+
+            node = steps[current]
+            node_type = node["type"]
+
+            # Also stop at any join type node (shouldn't happen in a split-switch
+            # branch, but be defensive)
+            if node_type == "join":
+                break
+
+            input_paths = _resolve_input_paths(current, node, run_id, task_ids, steps=steps)
+            task_id = "temporal-%s-%d" % (current, retry_count)
+            env_overrides = dict(node.get("env", {}))
+            env_overrides["METAFLOW_RUN_ID"] = run_id
+
+            inp = StepInput(
+                flow_name=cfg["flow_name"],
+                flow_file=cfg["flow_file"],
+                step_name=current,
+                run_id=run_id,
+                task_id=task_id,
+                input_paths=input_paths,
+                retry_count=retry_count,
+                max_retries=node.get("retries", 0),
+                split_index=-1,
+                env_overrides=env_overrides,
+                params_json="",
+                metadata_type=cfg.get("metadata_type", "local"),
+                datastore_type=cfg.get("datastore_type", "local"),
+                environment_type=cfg.get("environment_type", "local"),
+                event_logger_type=cfg.get("event_logger_type", "nullSidecarLogger"),
+                monitor_type=cfg.get("monitor_type", "nullSidecarMonitor"),
+                code_package_url=(cfg.get("code_package") or {}).get("url", ""),
+                code_package_sha=(cfg.get("code_package") or {}).get("sha", ""),
+                code_package_metadata=(cfg.get("code_package") or {}).get("metadata", ""),
+                decorator_specs=node.get("decorator_specs", []),
+                runtime_cli_decorators=node.get("runtime_cli_decorators", []),
+                tags=cfg.get("tags", []),
+            )
+
+            retry_policy = RetryPolicy(
+                maximum_attempts=node.get("retries", 0) + 1,
+                initial_interval=timedelta(seconds=node.get("retry_delay_seconds", 120)),
+            )
+            timeout_seconds = node.get("timeout_seconds", 3600)
+
+            out: StepOutput = await workflow.execute_activity(
+                run_metaflow_step,
+                inp,
+                start_to_close_timeout=timedelta(seconds=timeout_seconds),
+                retry_policy=retry_policy,
+            )
+            task_ids[current] = out.task_id
+
+            out_funcs = node["out_funcs"]
+            if not out_funcs:
+                break
+            next_step = out_funcs[0]
+            if next_step == merge_step:
+                break
+            current = next_step
+
+        return task_ids
+
 
 # ---------------------------------------------------------------------------
 # Pure helper functions (usable inside @workflow.defn via sandbox)
@@ -886,9 +1052,26 @@ class MetaflowWorkflow:
 
 
 def _resolve_input_paths(
-    step_name: str, node: dict, run_id: str, task_ids: dict
+    step_name: str, node: dict, run_id: str, task_ids: dict, steps: Optional[dict] = None
 ) -> str:
-    """Build comma-separated Metaflow input path(s) for a step."""
+    """Build comma-separated Metaflow input path(s) for a step.
+
+    Parameters
+    ----------
+    step_name:
+        The step whose input paths are being constructed.
+    node:
+        The compiled step config dict for ``step_name``.
+    run_id:
+        The Temporal run ID (also used as the Metaflow run ID).
+    task_ids:
+        Mapping of step_name -> task_id (or list of task_ids for foreach).
+        Only steps that actually executed will be present.
+    steps:
+        The full compiled steps dict from CONFIG.  When provided, used to
+        detect ``split-switch`` parents so that un-executed branches are
+        excluded from the join's input paths.
+    """
     in_funcs = node["in_funcs"]
 
     if step_name == "start":
@@ -923,9 +1106,32 @@ def _resolve_input_paths(
             )
         return "%s/%s/%s" % (run_id, parent, parent_task_id)
 
-    # Multiple parents (join after split)
+    # Multiple parents (join after split, or merge after split-switch).
+    # For split-switch merges, only ONE branch ran so we must skip parents
+    # that are absent from task_ids (the unchosen branches).
+    # For regular splits all branches always ran so we keep the fallback.
+    #
+    # A step is a "switch merge" when every parent step comes from a split-switch
+    # node (i.e. all in_funcs are direct out_funcs of the same split-switch step).
+    is_switch_merge = False
+    if steps is not None and len(in_funcs) > 1:
+        # Find which split-switch node(s) are direct parents of this step's branches
+        switch_parents = {
+            src
+            for src in in_funcs
+            if steps.get(src, {}).get("in_funcs") and
+            any(
+                steps.get(grandparent, {}).get("type") == "split-switch"
+                for grandparent in (steps.get(src, {}).get("in_funcs") or [])
+            )
+        }
+        is_switch_merge = len(switch_parents) == len(in_funcs)
+
     paths = []
     for parent in in_funcs:
+        if is_switch_merge and parent not in task_ids:
+            # This branch was not chosen by the split-switch — skip it.
+            continue
         parent_task_id = task_ids.get(parent, "temporal-%s-0" % parent)
         if isinstance(parent_task_id, list):
             paths.extend(
@@ -937,12 +1143,32 @@ def _resolve_input_paths(
 
 
 def _find_join_step(split_step_name: str, steps: dict) -> str | None:
-    """Find the join step that corresponds to the given split step."""
+    """Find the join step (type="join") that corresponds to a regular split step."""
     for name, node in steps.items():
         if node["type"] == "join":
             parents = node.get("split_parents", [])
             if parents and parents[-1] == split_step_name:
                 return name
+    return None
+
+
+def _find_switch_merge_step(switch_step_name: str, steps: dict) -> str | None:
+    """Find the merge step that follows a split-switch node.
+
+    For a split-switch, branches converge at a regular linear step (not a join
+    type).  This is the first step whose ``in_funcs`` contains at least one of
+    the switch branches as a direct parent.
+    """
+    switch_node = steps.get(switch_step_name)
+    if not switch_node:
+        return None
+    branch_names = set(switch_node.get("out_funcs", []))
+    for name, node in steps.items():
+        if name in branch_names:
+            continue
+        in_funcs = node.get("in_funcs", [])
+        if branch_names & set(in_funcs):
+            return name
     return None
 
 
