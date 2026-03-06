@@ -4,5 +4,10 @@
 
 scheduler:
   scheduler_type: temporal
+  deploy_args:
+    temporal_host: "localhost:7233"
 
-compute_env: {}
+compute_env:
+  METAFLOW_DEFAULT_METADATA: local
+  METAFLOW_DEFAULT_DATASTORE: local
+  METAFLOW_DEFAULT_ENVIRONMENT: local

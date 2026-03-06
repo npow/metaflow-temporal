@@ -122,9 +122,6 @@ def _top_level_args(inp: StepInput) -> list:
     # @conda, @sandbox, etc. take effect inside the subprocess.
     for spec in (inp.decorator_specs or []):
         args.append("--with=%s" % spec)
-    # Forward run tags
-    for tag in (inp.tags or []):
-        args.append("--tag=%s" % tag)
     return args
 
 
@@ -143,7 +140,6 @@ class _RuntimeCLIArgs(object):
             "event-logger": inp.event_logger_type,
             "monitor": inp.monitor_type,
             "with": list(inp.decorator_specs or []) + ["temporal_internal"],
-            "tag": list(inp.tags or []),
         }
         self.commands = ["step"]
         self.command_args = [inp.step_name]
@@ -154,6 +150,7 @@ class _RuntimeCLIArgs(object):
             "max-user-code-retries": inp.max_retries,
             "input-paths": input_paths,
             "split-index": inp.split_index if inp.split_index >= 0 else None,
+            "tag": list(inp.tags or []),
         }
         self.env = {}
 
@@ -264,6 +261,9 @@ def _build_init_cmd(inp: StepInput, params_task_id: str, params: dict) -> list:
         "--run-id", inp.run_id,
         "--task-id", params_task_id,
     ]
+    # Forward run tags (--tag is a subcommand option for init, not top-level)
+    for tag in (inp.tags or []):
+        init_args += ["--tag", tag]
     # Pass user parameters as CLI arguments to the init command
     # (the init command exposes flow Parameters via @add_custom_parameters)
     for k, v in params.items():
@@ -545,7 +545,9 @@ class MetaflowWorkflow:
 
     @workflow.run
     async def run(self, args: dict) -> str:
-        cfg = args["config"]
+        cfg = args.get("config")
+        if cfg is None or args.get("_use_embedded_config"):
+            cfg = CONFIG
         params = args.get("params", {})
         return await self._execute_graph(cfg, params)
 

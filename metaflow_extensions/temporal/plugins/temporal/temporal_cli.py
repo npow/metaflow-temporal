@@ -119,10 +119,13 @@ def create(
             json.dump(
                 {
                     "name": flow_name,
-                    "worker_file": os.path.abspath(output),
-                    "task_queue": t.task_queue,
-                    "temporal_host": temporal_host,
+                    "flow_name": flow_name,
                     "metadata": "{}",
+                    "additional_info": {
+                        "worker_file": os.path.abspath(output),
+                        "task_queue": t.task_queue,
+                        "temporal_host": temporal_host,
+                    },
                 },
                 f,
             )
