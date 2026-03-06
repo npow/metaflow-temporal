@@ -1,0 +1,8 @@
+######################################
+# UX Test Config for metaflow-temporal
+######################################
+
+scheduler:
+  scheduler_type: temporal
+
+compute_env: {}
