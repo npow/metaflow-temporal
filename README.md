@@ -248,10 +248,50 @@ When `confirm` raises, the workflow automatically runs `cancel_flight` then `can
 - Non-saga steps use `@step` identically to plain Metaflow — no change needed.
 - Compensation failures are logged but do not cascade (best-effort execution).
 
-**Limitations (v1)**
+Compensations are tracked for all step types: linear steps, foreach body tasks, and parallel split/join branches.
 
-- Compensations are tracked only for steps executed via the main linear path (`_execute_node`).
-  Steps inside `foreach` bodies and parallel split branches are not compensated.
+### Resume a failed run
+
+If a workflow fails partway through, resume it from where it left off — completed steps are
+skipped and only unfinished steps re-execute:
+
+```bash
+python my_flow.py temporal resume temporal-myflow-abc123
+```
+
+The run ID is printed when you trigger a run or shown in the Temporal UI. The resumed run
+reuses the same Metaflow run ID so all artifacts remain under the same pathspec.
+
+### Graceful shutdown
+
+The worker handles SIGTERM and SIGINT cleanly — in-progress activities finish before the
+process exits:
+
+```bash
+kill -TERM <worker_pid>   # or Ctrl-C
+# Worker shutting down gracefully.
+```
+
+### Namespace
+
+Forward a Metaflow namespace to every step subprocess:
+
+```bash
+python my_flow.py temporal create --output my_flow_worker.py --namespace production
+```
+
+### Auto-trigger on upstream completion
+
+Decorate your flow with `@trigger_on_finish` and the worker will poll for completed upstream
+runs and automatically trigger this flow when one finishes:
+
+```python
+from metaflow import FlowSpec, trigger_on_finish, step
+
+@trigger_on_finish(flow="UpstreamFlow")
+class DownstreamFlow(FlowSpec):
+    ...
+```
 
 ## How it works
 
@@ -299,11 +339,18 @@ pip install -e ".[dev]"
 pytest -v
 ```
 
-For Tier 2 tests against a real Temporal server:
+For integration tests against a real Temporal server (in-process worker):
 
 ```bash
 docker compose up -d
 pytest -v -m integration
+```
+
+For true end-to-end tests (generates real worker files, starts them as subprocesses):
+
+```bash
+docker compose up -d
+pytest -v -m e2e --timeout=300
 ```
 
 The Temporal UI is available at <http://localhost:8080>.
