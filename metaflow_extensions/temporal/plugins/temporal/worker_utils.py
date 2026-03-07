@@ -4,6 +4,7 @@ Metaflow Temporal worker runtime utilities.
 This file is embedded verbatim into generated worker files.
 """
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -244,11 +245,11 @@ def _runtime_step_decorators(inp: StepInput) -> list:
                 # Decorator failed to initialize (e.g. missing credentials).
                 # Skip it — using a partially-initialized decorator would produce
                 # malformed CLI arguments and silent failures.
-                import sys as _sys
+                deco_name = snap.get("name") or class_name
                 print(
                     "Warning: skipping decorator '%s' because external_init() "
-                    "raised: %s" % (name, exc),
-                    file=_sys.stderr,
+                    "raised: %s" % (deco_name, exc),
+                    file=sys.stderr,
                 )
                 continue
             decorators.append(deco)
@@ -316,9 +317,30 @@ def _build_dump_cmd(inp: StepInput, params_task_id: str) -> list:
     ]
 
 
-# Lock protecting temporary os.environ mutations in _read_artifact_names.
+# Lock protecting temporary os.environ mutations in _read_artifact_names,
+# _read_transition, and run_compensation.
 # Activities run in a ThreadPoolExecutor so concurrent calls are possible.
 _artifact_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _metaflow_datastore_env(datastore_root: str):
+    """Temporarily override METAFLOW_DATASTORE_SYSROOT_LOCAL under _artifact_lock.
+
+    Acquires ``_artifact_lock``, sets the env var, yields, then restores the
+    original value — even if an exception is raised inside the ``with`` block.
+    """
+    key = "METAFLOW_DATASTORE_SYSROOT_LOCAL"
+    with _artifact_lock:
+        old = os.environ.get(key)
+        os.environ[key] = datastore_root
+        try:
+            yield
+        finally:
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
 
 
 def _read_artifact_names(inp: StepInput) -> list:
@@ -343,19 +365,11 @@ def _read_artifact_names(inp: StepInput) -> list:
             inp.step_name,
             inp.task_id,
         )
-        with _artifact_lock:
-            old = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
-            os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = datastore_root
-            try:
-                metaflow.metadata(inp.metadata_type)
-                task = metaflow.Task(pathspec)
-                # Access only .id — does NOT deserialize the artifact data
-                return [a.id for a in task.artifacts if not a.id.startswith("_")]
-            finally:
-                if old is None:
-                    os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
-                else:
-                    os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old
+        with _metaflow_datastore_env(datastore_root):
+            metaflow.metadata(inp.metadata_type)
+            task = metaflow.Task(pathspec)
+            # Access only .id — does NOT deserialize the artifact data
+            return [a.id for a in task.artifacts if not a.id.startswith("_")]
     except Exception:
         return []
 
@@ -381,21 +395,13 @@ def _read_transition(inp: StepInput) -> Optional[str]:
             inp.step_name,
             inp.task_id,
         )
-        with _artifact_lock:
-            old = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
-            os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = datastore_root
-            try:
-                metaflow.metadata(inp.metadata_type)
-                task = metaflow.Task(pathspec)
-                transition = task["_transition"].data
-                # transition is a tuple: ([step_name], foreach_info_or_None)
-                if transition and isinstance(transition, (tuple, list)) and transition[0]:
-                    return transition[0][0]
-            finally:
-                if old is None:
-                    os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
-                else:
-                    os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old
+        with _metaflow_datastore_env(datastore_root):
+            metaflow.metadata(inp.metadata_type)
+            task = metaflow.Task(pathspec)
+            transition = task["_transition"].data
+            # transition is a tuple: ([step_name], foreach_info_or_None)
+            if transition and isinstance(transition, (tuple, list)) and transition[0]:
+                return transition[0][0]
     except Exception:
         pass
     return None
@@ -547,30 +553,22 @@ async def run_compensation(inp: CompensationInput) -> None:
     root = inp.datastore_root or _datastore_root_arg({}, inp.datastore_type)
     artifacts = {}
 
-    with _artifact_lock:
-        old = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
-        os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = root
-        try:
-            import metaflow
-            metaflow.metadata(inp.metadata_type)
-            pathspec = "%s/%s/%s/%s" % (
-                inp.flow_name,
-                inp.run_id,
-                inp.forward_step,
-                inp.task_id,
-            )
-            task = metaflow.Task(pathspec)
-            for a in task.artifacts:
-                if not a.id.startswith("_"):
-                    try:
-                        artifacts[a.id] = getattr(task.data, a.id)
-                    except Exception:
-                        pass
-        finally:
-            if old is None:
-                os.environ.pop("METAFLOW_DATASTORE_SYSROOT_LOCAL", None)
-            else:
-                os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old
+    with _metaflow_datastore_env(root):
+        import metaflow
+        metaflow.metadata(inp.metadata_type)
+        pathspec = "%s/%s/%s/%s" % (
+            inp.flow_name,
+            inp.run_id,
+            inp.forward_step,
+            inp.task_id,
+        )
+        task = metaflow.Task(pathspec)
+        for a in task.artifacts:
+            if not a.id.startswith("_"):
+                try:
+                    artifacts[a.id] = getattr(task.data, a.id)
+                except Exception:
+                    pass
 
     # Load the flow module, create a bare instance, inject artifacts, call handler.
     # We inject directly into __dict__ to bypass FlowSpec.__getattr__/__setattr__
@@ -618,7 +616,7 @@ def _make_step_input(
     retry_count: int,
     split_index: int,
     params: dict,
-) -> "StepInput":
+) -> StepInput:
     """Build a StepInput from compiled config, node config, and runtime values."""
     code_pkg = cfg.get("code_package") or {}
     env_overrides = dict(node.get("env", {}))
@@ -842,20 +840,19 @@ class MetaflowWorkflow:
             # already read _transition from the datastore and put the chosen
             # branch name in out.chosen_branch.
             chosen_branch = out.chosen_branch
-
             if chosen_branch is None:
                 # Fallback: if _transition could not be read, run the first branch.
                 chosen_branch = node["out_funcs"][0] if node["out_funcs"] else None
 
+            merge_step = _find_switch_merge_step(step_name, steps)
+
             if chosen_branch:
-                merge_step = _find_switch_merge_step(step_name, steps)
                 branch_task_ids = await self._execute_branch_until_switch_merge(
-                    chosen_branch, cfg, run_id, params, retry_count,
+                    chosen_branch, cfg, run_id, retry_count,
                     dict(task_ids), merge_step,
                 )
                 task_ids.update(branch_task_ids)
 
-            merge_step = _find_switch_merge_step(step_name, steps)
             if merge_step:
                 await self._execute_node(merge_step, cfg, run_id, task_ids, params, -1, resume_state)
 
@@ -864,7 +861,7 @@ class MetaflowWorkflow:
             branch_results = await asyncio.gather(
                 *[
                     self._execute_branch_until_join(
-                        branch, cfg, run_id, params, retry_count, dict(shared_ids)
+                        branch, cfg, run_id, retry_count, dict(shared_ids)
                     )
                     for branch in node["out_funcs"]
                 ]
@@ -1005,9 +1002,8 @@ class MetaflowWorkflow:
         step_name: str,
         cfg: dict,
         run_id: str,
-        params: dict,
         retry_count: int,
-        task_ids: dict = None,
+        task_ids: Optional[dict] = None,
     ) -> dict:
         """Execute a branch from step_name until it reaches a join node.
 
@@ -1042,7 +1038,6 @@ class MetaflowWorkflow:
         step_name: str,
         cfg: dict,
         run_id: str,
-        params: dict,
         retry_count: int,
         task_ids: dict,
         merge_step: Optional[str],
@@ -1142,22 +1137,11 @@ def _resolve_input_paths(
     # For split-switch merges, only ONE branch ran so we must skip parents
     # that are absent from task_ids (the unchosen branches).
     # For regular splits all branches always ran so we keep the fallback.
-    #
-    # A step is a "switch merge" when every parent step comes from a split-switch
-    # node (i.e. all in_funcs are direct out_funcs of the same split-switch step).
-    is_switch_merge = False
-    if steps is not None and len(in_funcs) > 1:
-        # Find which split-switch node(s) are direct parents of this step's branches
-        switch_parents = {
-            src
-            for src in in_funcs
-            if steps.get(src, {}).get("in_funcs") and
-            any(
-                steps.get(grandparent, {}).get("type") == "split-switch"
-                for grandparent in (steps.get(src, {}).get("in_funcs") or [])
-            )
-        }
-        is_switch_merge = len(switch_parents) == len(in_funcs)
+    is_switch_merge = (
+        steps is not None
+        and len(in_funcs) > 1
+        and _is_switch_merge_step(in_funcs, steps)
+    )
 
     paths = []
     for parent in in_funcs:
@@ -1172,6 +1156,23 @@ def _resolve_input_paths(
         else:
             paths.append("%s/%s/%s" % (run_id, parent, parent_task_id))
     return ",".join(paths)
+
+
+def _is_switch_merge_step(in_funcs: list, steps: dict) -> bool:
+    """Return True when every parent of a step traces back to a split-switch node.
+
+    Used to detect merge steps after conditional branches so that un-executed
+    branch steps are excluded from the join's input paths.
+    """
+    switch_parents = {
+        src
+        for src in in_funcs
+        if any(
+            steps.get(grandparent, {}).get("type") == "split-switch"
+            for grandparent in (steps.get(src, {}).get("in_funcs") or [])
+        )
+    }
+    return len(switch_parents) == len(in_funcs)
 
 
 def _find_join_step(split_step_name: str, steps: dict) -> str | None:
