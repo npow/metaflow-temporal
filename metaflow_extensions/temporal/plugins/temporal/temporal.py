@@ -173,7 +173,17 @@ class Temporal:
             }
             try:
                 default = param.kwargs.get("default")
-                if default is not None and not callable(default):
+                if default is None:
+                    pass
+                elif callable(default):
+                    warnings.warn(
+                        "Parameter '%s' has a callable default. Its value cannot be "
+                        "baked into the worker file — you must supply it explicitly "
+                        "at trigger time (e.g. trigger %s=<value>)." % (var, var),
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                else:
                     params[var]["default"] = default
             except Exception:
                 pass
@@ -225,7 +235,8 @@ class Temporal:
             if name in ("temporal_internal",):
                 continue
             if name in ("retry", "timeout", "environment", "project", "trigger",
-                        "trigger_on_finish", "schedule", "card", "catch"):
+                        "trigger_on_finish", "schedule", "card", "catch",
+                        "sandbox", "daytona", "e2b", "boxlite"):
                 continue
             try:
                 spec = d.make_decorator_spec()
@@ -272,6 +283,13 @@ class Temporal:
                 try:
                     json.dumps(v)
                 except Exception:
+                    warnings.warn(
+                        "Decorator '%s' field '%s' is not JSON-serializable and "
+                        "will not be forwarded to the worker. Runtime behavior "
+                        "may differ if this field is required by runtime_step_cli." % (name, k),
+                        UserWarning,
+                        stacklevel=2,
+                    )
                     continue
                 state[k] = v
 

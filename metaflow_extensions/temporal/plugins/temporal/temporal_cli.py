@@ -8,6 +8,39 @@ from metaflow.util import get_username
 from .temporal import Temporal
 
 
+def _resolve_task_queue(obj, task_queue, branch=None, production=False):
+    """Return the effective Temporal task queue name.
+
+    Mirrors the logic in ``Temporal.__init__`` so that ``trigger`` and
+    ``resume`` use the same queue as the compiled worker.  For @project flows
+    the queue name includes the project-aware flow name; for plain flows it is
+    simply ``metaflow-<flowname>``.
+    """
+    if task_queue is not None:
+        return task_queue
+    flow_name = obj.graph.name
+    try:
+        from metaflow.plugins.project_decorator import format_name
+
+        flow_decos = getattr(obj.flow, "_flow_decorators", {})
+        project_list = flow_decos.get("project", [])
+        if project_list:
+            d = project_list[0]
+            project_name = d.attributes.get("name")
+            if project_name:
+                project_flow_name, _ = format_name(
+                    flow_name,
+                    project_name,
+                    production,
+                    branch,
+                    get_username() or "",
+                )
+                flow_name = project_flow_name
+    except Exception:
+        pass
+    return "metaflow-%s" % flow_name.lower().replace(".", "-")
+
+
 @click.group()
 def cli():
     pass
@@ -162,6 +195,17 @@ def create(
     default=None,
     help="Flow parameter as key=value (repeatable).",
 )
+@click.option(
+    "--branch",
+    default=None,
+    help="@project branch name (must match the compiled worker's branch).",
+)
+@click.option(
+    "--production",
+    is_flag=True,
+    default=False,
+    help="Target the @project production branch (must match the compiled worker).",
+)
 def trigger(
     obj,
     name,
@@ -170,6 +214,8 @@ def trigger(
     workflow_timeout,
     deployer_attribute_file,
     run_params,
+    branch,
+    production,
 ):
     """Trigger a Temporal workflow run and write run info for the Deployer API."""
     import asyncio
@@ -177,8 +223,7 @@ def trigger(
     from datetime import timedelta
 
     flow_name = name or obj.graph.name
-    if task_queue is None:
-        task_queue = "metaflow-%s" % flow_name.lower().replace(".", "-")
+    task_queue = _resolve_task_queue(obj, task_queue, branch=branch, production=production)
 
     params = {}
     for kv in run_params:
@@ -253,7 +298,18 @@ def trigger(
     default=None,
     help="Flow parameter as key=value (override for the resumed run, repeatable).",
 )
-def resume(obj, run_id, name, task_queue, temporal_host, workflow_timeout, run_params):
+@click.option(
+    "--branch",
+    default=None,
+    help="@project branch name (must match the compiled worker's branch).",
+)
+@click.option(
+    "--production",
+    is_flag=True,
+    default=False,
+    help="Target the @project production branch (must match the compiled worker).",
+)
+def resume(obj, run_id, name, task_queue, temporal_host, workflow_timeout, run_params, branch, production):
     """Resume a previously failed or incomplete Temporal workflow run.
 
     RUN_ID is the Metaflow run ID of the run to resume (e.g. temporal-myflow-abc123).
@@ -262,8 +318,7 @@ def resume(obj, run_id, name, task_queue, temporal_host, workflow_timeout, run_p
     import asyncio
 
     flow_name = name or obj.graph.name
-    if task_queue is None:
-        task_queue = "metaflow-%s" % flow_name.lower().replace(".", "-")
+    task_queue = _resolve_task_queue(obj, task_queue, branch=branch, production=production)
 
     params = {}
     for kv in run_params:

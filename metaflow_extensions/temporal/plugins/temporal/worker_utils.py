@@ -20,7 +20,7 @@ from typing import List, Optional
 from temporalio import activity, workflow
 from temporalio.client import Client
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, CancelledError as TemporalCancelledError
 from temporalio.worker import Worker
 
 
@@ -224,8 +224,17 @@ def _runtime_step_decorators(inp: StepInput) -> list:
             # initialize themselves (e.g. resolve credentials, set endpoints).
             try:
                 deco.external_init()
-            except Exception:
-                pass
+            except Exception as exc:
+                # Decorator failed to initialize (e.g. missing credentials).
+                # Skip it — using a partially-initialized decorator would produce
+                # malformed CLI arguments and silent failures.
+                import sys as _sys
+                print(
+                    "Warning: skipping decorator '%s' because external_init() "
+                    "raised: %s" % (name, exc),
+                    file=_sys.stderr,
+                )
+                continue
             decorators.append(deco)
         except Exception:
             continue
@@ -322,7 +331,7 @@ def _read_artifact_names(inp: StepInput) -> list:
             old = os.environ.get("METAFLOW_DATASTORE_SYSROOT_LOCAL")
             os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = datastore_root
             try:
-                metaflow.metadata("local")
+                metaflow.metadata(inp.metadata_type)
                 task = metaflow.Task(pathspec)
                 # Access only .id — does NOT deserialize the artifact data
                 return [a.id for a in task.artifacts if not a.id.startswith("_")]
@@ -393,18 +402,33 @@ async def _run_subprocess(cmd: list, env: dict) -> tuple:
             await asyncio.sleep(20)
             try:
                 activity.heartbeat()
+            except TemporalCancelledError:
+                # Activity was cancelled — kill the subprocess so it doesn't
+                # keep running after Temporal has given up on this activity.
+                proc.kill()
+                raise
             except Exception:
+                # Transient heartbeat error (e.g. network blip) — stop
+                # heartbeating but let the subprocess finish normally.
                 break
 
     hb_task = asyncio.ensure_future(_hb())
     try:
         stdout_bytes, stderr_bytes = await proc.communicate()
+    except BaseException:
+        # asyncio.CancelledError or any unexpected error while waiting for the
+        # subprocess — kill it to avoid leaving zombie processes.
+        proc.kill()
+        await proc.wait()
+        raise
     finally:
         hb_task.cancel()
         try:
             await hb_task
         except asyncio.CancelledError:
             pass
+        # TemporalCancelledError (or other real exceptions) from _hb propagate
+        # up naturally — they are NOT caught here.
 
     return (
         proc.returncode,
@@ -540,12 +564,23 @@ async def run_compensation(inp: CompensationInput) -> None:
     spec.loader.exec_module(module)
     flow_class = getattr(module, inp.flow_class_name)
     instance = object.__new__(flow_class)
-    # Seed internal FlowSpec state to prevent __getattr__ recursion
-    instance.__dict__["_datastore"] = None
+    # Seed internal FlowSpec state to prevent __getattr__ recursion.
+    # FlowSpec.__getattr__ checks for _datastore; other private attributes
+    # may be accessed by helper methods the handler transitively calls.
+    for attr, default in [
+        ("_datastore", None),
+        ("_graph", None),
+        ("_flow_decorators", {}),
+        ("_success", False),
+        ("_task_ok", False),
+        ("_ubf_context", None),
+        ("_environment", None),
+    ]:
+        instance.__dict__.setdefault(attr, default)
     for k, v in artifacts.items():
         instance.__dict__[k] = v
     handler = getattr(instance, inp.handler_name)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     if asyncio.iscoroutinefunction(handler):
         await handler()
     else:
