@@ -29,13 +29,12 @@ jobs:
         run: |
           python - <<'EOF'
           import asyncio, sys
-          from datetime import timedelta
 
           async def wait():
               from temporalio.client import Client
               for i in range(60):
                   try:
-                      await Client.connect("localhost:7233", rpc_timeout=timedelta(seconds=2))
+                      await asyncio.wait_for(Client.connect("localhost:7233"), timeout=3.0)
                       print("Temporal is ready!")
                       return
                   except Exception as e:
