@@ -50,4 +50,5 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "integration: requires external Temporal server (docker-compose)",
+    "e2e: true end-to-end tests against a real Temporal server with real worker subprocess",
 ]
