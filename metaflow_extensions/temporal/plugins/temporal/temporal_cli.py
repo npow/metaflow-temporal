@@ -227,3 +227,91 @@ def trigger(
                 },
                 f,
             )
+
+
+@temporal.command(help="Resume a previously failed or incomplete Temporal workflow run.")
+@click.pass_obj
+@click.argument("run_id")
+@click.option("--name", default=None, help="Flow name (defaults to graph name)")
+@click.option("--task-queue", default=None, help="Temporal task queue name")
+@click.option(
+    "--temporal-host",
+    default="localhost:7233",
+    show_default=True,
+    help="Temporal server host:port",
+)
+@click.option(
+    "--workflow-timeout",
+    default=None,
+    type=int,
+    help="Maximum seconds a workflow execution may run (default: no limit)",
+)
+@click.option(
+    "--run-param",
+    "run_params",
+    multiple=True,
+    default=None,
+    help="Flow parameter as key=value (override for the resumed run, repeatable).",
+)
+def resume(obj, run_id, name, task_queue, temporal_host, workflow_timeout, run_params):
+    """Resume a previously failed or incomplete Temporal workflow run.
+
+    RUN_ID is the Metaflow run ID of the run to resume (e.g. temporal-myflow-abc123).
+    Completed steps are skipped; only steps that did not finish will re-execute.
+    """
+    import asyncio
+
+    flow_name = name or obj.graph.name
+    if task_queue is None:
+        task_queue = "metaflow-%s" % flow_name.lower().replace(".", "-")
+
+    params = {}
+    for kv in run_params:
+        k, _, v = kv.partition("=")
+        params[k.strip()] = v.strip()
+
+    async def _resume():
+        import metaflow
+        from temporalio.client import Client
+        from datetime import timedelta
+
+        # Discover which steps completed by inspecting the Metaflow datastore.
+        try:
+            mf_run = metaflow.Run("%s/%s" % (flow_name, run_id))
+            resume_state = {}
+            for step in mf_run:
+                tasks = list(step.tasks())
+                if tasks and all(t.successful for t in tasks):
+                    if len(tasks) == 1:
+                        resume_state[step.id] = {"task_id": tasks[0].id}
+                    else:
+                        resume_state[step.id] = {"task_ids": [t.id for t in tasks]}
+        except Exception as e:
+            click.echo("Warning: could not read prior run state: %s" % e, err=True)
+            resume_state = {}
+
+        client = await Client.connect(temporal_host)
+        import uuid
+        new_workflow_id = "%s-resume-%s" % (flow_name.lower(), uuid.uuid4().hex[:8])
+        execution_timeout = timedelta(seconds=workflow_timeout) if workflow_timeout else None
+
+        handle = await client.start_workflow(
+            "MetaflowWorkflow",
+            {
+                "config": None,
+                "params": params,
+                "_use_embedded_config": True,
+                "resume_state": resume_state,
+                "run_id_override": run_id,
+            },
+            id=new_workflow_id,
+            task_queue=task_queue,
+            execution_timeout=execution_timeout,
+        )
+        click.echo("Resumed workflow: %s (original run ID: %s)" % (new_workflow_id, run_id))
+        click.echo("Waiting for completion...")
+        result = await handle.result()
+        click.echo("Workflow completed. Run ID: %s" % result)
+        return result
+
+    asyncio.run(_resume())

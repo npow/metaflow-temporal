@@ -126,10 +126,14 @@ class Temporal:
             "project": self._project_info,
             # Workflow execution timeout in seconds (None = no limit)
             "workflow_timeout_seconds": self.workflow_timeout_seconds,
+            # Metaflow namespace (forwarded to step subprocesses via --namespace)
+            "namespace": self.namespace or "",
             # Saga compensation map: {"step_name": "handler_method_name", ...}
             "compensations": self._build_compensations(),
             # Original Python class name (needed by run_compensation to importlib-load the class)
             "flow_class_name": self.flow.__class__.__name__,
+            # @trigger_on_finish / @trigger upstream flows that should auto-trigger this flow
+            "trigger_on_finish": self._get_trigger_on_finish(),
             # Uploaded code package metadata for remote runtime decorators
             # (e.g. sandbox/daytona/e2b, batch, kubernetes).
             "code_package": self._get_code_package_info(),
@@ -188,6 +192,7 @@ class Temporal:
                 # The worker reads _transition from the datastore after the step runs
                 # to determine which single branch was chosen at runtime.
                 "condition": getattr(node, "condition", None),
+                "has_card": any(d.name == "card" for d in node.decorators),
                 "env": self._step_env(node),
                 "timeout_seconds": self._get_timeout(node),
                 "retries": self._get_retries(node),
@@ -220,7 +225,7 @@ class Temporal:
             if name in ("temporal_internal",):
                 continue
             if name in ("retry", "timeout", "environment", "project", "trigger",
-                        "trigger_on_finish", "schedule", "card"):
+                        "trigger_on_finish", "schedule", "card", "catch"):
                 continue
             try:
                 spec = d.make_decorator_spec()
@@ -390,6 +395,28 @@ class Temporal:
             }
         except Exception:
             return None
+
+    def _get_trigger_on_finish(self) -> list:
+        """Extract @trigger_on_finish and @trigger decorator config from flow-level decorators."""
+        triggers = []
+        try:
+            flow_decos = getattr(self.flow, "_flow_decorators", {})
+            for deco_name in ("trigger_on_finish", "trigger"):
+                for d in flow_decos.get(deco_name, []):
+                    attrs = getattr(d, "attributes", {})
+                    flow_ref = attrs.get("flow") or attrs.get("flows")
+                    if not flow_ref:
+                        continue
+                    if isinstance(flow_ref, str):
+                        triggers.append({"flow": flow_ref})
+                    elif isinstance(flow_ref, (list, tuple)):
+                        for f in flow_ref:
+                            name = f if isinstance(f, str) else getattr(f, "__name__", None)
+                            if name:
+                                triggers.append({"flow": name})
+        except Exception:
+            pass
+        return triggers
 
     def _build_compensations(self) -> dict:
         """Scan the flow class for @compensate-decorated methods and return the mapping."""

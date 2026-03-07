@@ -6,6 +6,7 @@ This file is embedded verbatim into generated worker files.
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -61,6 +62,8 @@ class StepInput:
     runtime_cli_decorators: Optional[List[dict]] = None
     # Run tags forwarded as --tag flags to each step subprocess
     tags: Optional[List[str]] = None
+    # Metaflow namespace (--namespace flag for step subprocess)
+    namespace: str = ""
 
 
 @dataclass
@@ -118,6 +121,8 @@ def _top_level_args(inp: StepInput) -> list:
         "--event-logger=%s" % inp.event_logger_type,
         "--monitor=%s" % inp.monitor_type,
     ]
+    if inp.namespace:
+        args.append("--namespace=%s" % inp.namespace)
     # Forward compute/environment backend decorators so that @kubernetes, @batch,
     # @conda, @sandbox, etc. take effect inside the subprocess.
     for spec in (inp.decorator_specs or []):
@@ -215,6 +220,12 @@ def _runtime_step_decorators(inp: StepInput) -> list:
                             setattr(deco, attr, value)
                     except Exception:
                         pass
+            # Call external_init so decorators that launch remote runtimes can
+            # initialize themselves (e.g. resolve credentials, set endpoints).
+            try:
+                deco.external_init()
+            except Exception:
+                pass
             decorators.append(deco)
         except Exception:
             continue
@@ -365,6 +376,43 @@ def _read_transition(inp: StepInput) -> Optional[str]:
     return None
 
 
+async def _run_subprocess(cmd: list, env: dict) -> tuple:
+    """Run a subprocess, heartbeating every 20 s so the activity lease stays alive.
+
+    Returns (returncode, stdout_str, stderr_str).
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def _hb():
+        while True:
+            await asyncio.sleep(20)
+            try:
+                activity.heartbeat()
+            except Exception:
+                break
+
+    hb_task = asyncio.ensure_future(_hb())
+    try:
+        stdout_bytes, stderr_bytes = await proc.communicate()
+    finally:
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
+
+    return (
+        proc.returncode,
+        stdout_bytes.decode(errors="replace"),
+        stderr_bytes.decode(errors="replace"),
+    )
+
+
 @activity.defn(name="run_metaflow_step")
 async def run_metaflow_step(inp: StepInput) -> StepOutput:
     """Execute a single Metaflow step as a Temporal activity."""
@@ -381,7 +429,6 @@ async def run_metaflow_step(inp: StepInput) -> StepOutput:
         }
 
         input_paths = inp.input_paths
-        loop = asyncio.get_event_loop()
 
         if inp.step_name == "start" and inp.params_json:
             params = json.loads(inp.params_json)
@@ -390,50 +437,28 @@ async def run_metaflow_step(inp: StepInput) -> StepOutput:
                 env["METAFLOW_INIT_%s" % k.upper()] = str(v)
 
             # Check if _parameters task already exists (idempotent on retry)
-            check_result = await loop.run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    _build_dump_cmd(inp, params_task_id),
-                    env=env,
-                    capture_output=True,
-                ),
-            )
-            if check_result.returncode != 0:
-                init_result = await loop.run_in_executor(
-                    None,
-                    lambda: subprocess.run(
-                        _build_init_cmd(inp, params_task_id, params),
-                        env=env,
-                        capture_output=True,
-                    ),
+            check_rc, _, _ = await _run_subprocess(_build_dump_cmd(inp, params_task_id), env)
+            if check_rc != 0:
+                init_rc, init_stdout, init_stderr = await _run_subprocess(
+                    _build_init_cmd(inp, params_task_id, params), env
                 )
-                if init_result.returncode != 0:
-                    stderr = init_result.stderr.decode(errors="replace")
-                    stdout = init_result.stdout.decode(errors="replace")
+                if init_rc != 0:
                     raise ApplicationError(
-                        "Parameters init failed: stdout=%s stderr=%s" % (stdout[-1000:], stderr[-1000:])
+                        "Parameters init failed: stdout=%s stderr=%s"
+                        % (init_stdout[-1000:], init_stderr[-1000:])
                     )
 
             input_paths = "%s/_parameters/%s" % (inp.run_id, params_task_id)
 
         step_cmd, step_env = _build_step_cmd(inp, input_paths)
-        result = await loop.run_in_executor(
-            None,
-            lambda: subprocess.run(
-                step_cmd,
-                env={**env, **step_env},
-                capture_output=True,
-            ),
-        )
+        rc, stdout, stderr = await _run_subprocess(step_cmd, {**env, **step_env})
 
-        if result.returncode != 0:
-            stderr = result.stderr.decode(errors="replace")
-            stdout = result.stdout.decode(errors="replace")
+        if rc != 0:
             raise ApplicationError(
                 "Step %s failed (exit %d):\nCMD: %s\nSTDOUT: %s\nSTDERR: %s"
                 % (
                     inp.step_name,
-                    result.returncode,
+                    rc,
                     " ".join(str(x) for x in step_cmd),
                     stdout[-2000:],
                     stderr[-2000:],
@@ -528,6 +553,61 @@ async def run_compensation(inp: CompensationInput) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Workflow helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_step_input(
+    cfg: dict,
+    node: dict,
+    step_name: str,
+    run_id: str,
+    task_id: str,
+    input_paths: str,
+    retry_count: int,
+    split_index: int,
+    params: dict,
+) -> "StepInput":
+    """Build a StepInput from compiled config, node config, and runtime values."""
+    code_pkg = cfg.get("code_package") or {}
+    env_overrides = dict(node.get("env", {}))
+    env_overrides["METAFLOW_RUN_ID"] = run_id
+    return StepInput(
+        flow_name=cfg["flow_name"],
+        flow_file=cfg["flow_file"],
+        step_name=step_name,
+        run_id=run_id,
+        task_id=task_id,
+        input_paths=input_paths,
+        retry_count=retry_count,
+        max_retries=node.get("retries", 0),
+        split_index=split_index,
+        env_overrides=env_overrides,
+        params_json=json.dumps(params) if step_name == "start" else "",
+        metadata_type=cfg.get("metadata_type", "local"),
+        datastore_type=cfg.get("datastore_type", "local"),
+        environment_type=cfg.get("environment_type", "local"),
+        event_logger_type=cfg.get("event_logger_type", "nullSidecarLogger"),
+        monitor_type=cfg.get("monitor_type", "nullSidecarMonitor"),
+        code_package_url=code_pkg.get("url", ""),
+        code_package_sha=code_pkg.get("sha", ""),
+        code_package_metadata=code_pkg.get("metadata", ""),
+        decorator_specs=node.get("decorator_specs", []),
+        runtime_cli_decorators=node.get("runtime_cli_decorators", []),
+        tags=cfg.get("tags", []),
+        namespace=cfg.get("namespace", ""),
+    )
+
+
+def _make_retry_policy(node: dict) -> "RetryPolicy":
+    """Build a Temporal RetryPolicy from a compiled step node config."""
+    return RetryPolicy(
+        maximum_attempts=node.get("retries", 0) + 1,
+        initial_interval=timedelta(seconds=node.get("retry_delay_seconds", 120)),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Workflow
 # ---------------------------------------------------------------------------
 
@@ -549,18 +629,44 @@ class MetaflowWorkflow:
         if cfg is None or args.get("_use_embedded_config"):
             cfg = CONFIG
         params = args.get("params", {})
-        return await self._execute_graph(cfg, params)
+        resume_state = args.get("resume_state")  # {step_name: {"task_id": str}, ...}
+        run_id_override = args.get("run_id_override")
+        return await self._execute_graph(cfg, params, resume_state, run_id_override)
 
-    async def _execute_graph(self, cfg: dict, params: dict) -> str:
-        run_id = "temporal-%s" % workflow.info().workflow_id[:20]
+    async def _execute_graph(
+        self,
+        cfg: dict,
+        params: dict,
+        resume_state: Optional[dict] = None,
+        run_id_override: Optional[str] = None,
+    ) -> str:
+        if run_id_override:
+            run_id = run_id_override
+        else:
+            run_id = "temporal-%s" % workflow.info().workflow_id[:20]
+        # Seed task_ids from resume_state so that already-completed steps are
+        # skipped and their task_ids are available for input_paths resolution.
         task_ids: dict = {}
+        if resume_state:
+            for step_name, state in resume_state.items():
+                task_ids[step_name] = state.get("task_ids") or state.get("task_id", "")
         try:
-            await self._execute_node("start", cfg, run_id, task_ids, params, -1)
+            await self._execute_node("start", cfg, run_id, task_ids, params, -1, resume_state)
             return run_id
         except Exception:
             if cfg.get("compensations") and self._compensation_stack:
                 await self._run_compensations(cfg, run_id)
             raise
+
+    def _push_compensation(self, cfg: dict, step_name: str, task_id: str) -> None:
+        """Push step onto the saga compensation stack if it has a registered handler."""
+        handler = cfg.get("compensations", {}).get(step_name)
+        if handler:
+            self._compensation_stack.append({
+                "handler": handler,
+                "step": step_name,
+                "task_id": task_id,
+            })
 
     async def _run_compensations(self, cfg: dict, run_id: str) -> None:
         """Run all queued compensations in LIFO order (best-effort)."""
@@ -597,10 +703,26 @@ class MetaflowWorkflow:
         task_ids: dict,
         params: dict,
         split_index: int,
+        resume_state: Optional[dict] = None,
     ):
         steps = cfg["steps"]
         node = steps[step_name]
         node_type = node["type"]
+
+        # Resume: skip steps that already completed in a prior run.
+        # task_ids are pre-seeded from resume_state in _execute_graph.
+        if resume_state and step_name in resume_state:
+            if step_name == "end":
+                return
+            if node_type == "foreach":
+                body_step = node["out_funcs"][0]
+                body_node = steps[body_step]
+                join_step = body_node["out_funcs"][0]
+                await self._execute_node(join_step, cfg, run_id, task_ids, params, -1, resume_state)
+                return
+            for next_step in node["out_funcs"]:
+                await self._execute_node(next_step, cfg, run_id, task_ids, params, -1, resume_state)
+            return
 
         input_paths = _resolve_input_paths(step_name, node, run_id, task_ids, steps=steps)
 
@@ -611,57 +733,20 @@ class MetaflowWorkflow:
         else:
             task_id = "temporal-%s-%d" % (step_name, retry_count)
 
-        env_overrides = dict(node.get("env", {}))
-        env_overrides["METAFLOW_RUN_ID"] = run_id
-
-        inp = StepInput(
-            flow_name=cfg["flow_name"],
-            flow_file=cfg["flow_file"],
-            step_name=step_name,
-            run_id=run_id,
-            task_id=task_id,
-            input_paths=input_paths,
-            retry_count=retry_count,
-            max_retries=node.get("retries", 0),
-            split_index=split_index,
-            env_overrides=env_overrides,
-            params_json=json.dumps(params) if step_name == "start" else "",
-            metadata_type=cfg.get("metadata_type", "local"),
-            datastore_type=cfg.get("datastore_type", "local"),
-            environment_type=cfg.get("environment_type", "local"),
-            event_logger_type=cfg.get("event_logger_type", "nullSidecarLogger"),
-            monitor_type=cfg.get("monitor_type", "nullSidecarMonitor"),
-            code_package_url=(cfg.get("code_package") or {}).get("url", ""),
-            code_package_sha=(cfg.get("code_package") or {}).get("sha", ""),
-            code_package_metadata=(cfg.get("code_package") or {}).get("metadata", ""),
-            decorator_specs=node.get("decorator_specs", []),
-            runtime_cli_decorators=node.get("runtime_cli_decorators", []),
-            tags=cfg.get("tags", []),
-        )
-
-        retry_policy = RetryPolicy(
-            maximum_attempts=node.get("retries", 0) + 1,
-            initial_interval=timedelta(seconds=node.get("retry_delay_seconds", 120)),
-        )
+        inp = _make_step_input(cfg, node, step_name, run_id, task_id, input_paths, retry_count, split_index, params)
+        retry_policy = _make_retry_policy(node)
         timeout_seconds = node.get("timeout_seconds", 3600)
 
         out: StepOutput = await workflow.execute_activity(
             run_metaflow_step,
             inp,
             start_to_close_timeout=timedelta(seconds=timeout_seconds),
+            heartbeat_timeout=timedelta(seconds=60),
             retry_policy=retry_policy,
         )
 
         task_ids[step_name] = out.task_id
-
-        # Push to saga compensation stack if this step has a registered compensation
-        compensations = cfg.get("compensations", {})
-        if step_name in compensations:
-            self._compensation_stack.append({
-                "handler": compensations[step_name],
-                "step": step_name,
-                "task_id": out.task_id,
-            })
+        self._push_compensation(cfg, step_name, out.task_id)
 
         if step_name == "end":
             return
@@ -704,7 +789,7 @@ class MetaflowWorkflow:
             # Continue to join
             body_node = steps[body_step]
             join_step = body_node["out_funcs"][0]
-            await self._execute_node(join_step, cfg, run_id, task_ids, params, -1)
+            await self._execute_node(join_step, cfg, run_id, task_ids, params, -1, resume_state)
 
         elif node_type == "split-switch":
             # Only one branch runs at runtime.  The run_metaflow_step activity
@@ -717,8 +802,6 @@ class MetaflowWorkflow:
                 chosen_branch = node["out_funcs"][0] if node["out_funcs"] else None
 
             if chosen_branch:
-                # Execute only the chosen branch step(s) until we reach the merge
-                # point.  The merge step is a regular linear step (not a join type).
                 merge_step = _find_switch_merge_step(step_name, steps)
                 branch_task_ids = await self._execute_branch_until_switch_merge(
                     chosen_branch, cfg, run_id, params, retry_count,
@@ -726,38 +809,30 @@ class MetaflowWorkflow:
                 )
                 task_ids.update(branch_task_ids)
 
-            # Execute the merge step (the linear step where branches converge).
-            # _resolve_input_paths will skip the non-executed branch's input path.
             merge_step = _find_switch_merge_step(step_name, steps)
             if merge_step:
-                await self._execute_node(merge_step, cfg, run_id, task_ids, params, -1)
+                await self._execute_node(merge_step, cfg, run_id, task_ids, params, -1, resume_state)
 
         elif node_type == "split":
-            out_funcs = node["out_funcs"]
-            # Pass a snapshot of the current task_ids to each branch so they
-            # can resolve input_paths for the first step (whose parent is this
-            # split node, already in task_ids).
             shared_ids = dict(task_ids)
             branch_results = await asyncio.gather(
                 *[
                     self._execute_branch_until_join(
                         branch, cfg, run_id, params, retry_count, dict(shared_ids)
                     )
-                    for branch in out_funcs
+                    for branch in node["out_funcs"]
                 ]
             )
-            # Merge per-branch task_ids back
             for branch_task_ids in branch_results:
                 task_ids.update(branch_task_ids)
 
-            # Find the join node that corresponds to this split
             join_step = _find_join_step(step_name, steps)
             if join_step:
-                await self._execute_node(join_step, cfg, run_id, task_ids, params, -1)
+                await self._execute_node(join_step, cfg, run_id, task_ids, params, -1, resume_state)
 
         else:
             for next_step in node["out_funcs"]:
-                await self._execute_node(next_step, cfg, run_id, task_ids, params, -1)
+                await self._execute_node(next_step, cfg, run_id, task_ids, params, -1, resume_state)
 
     async def _execute_foreach_slice(
         self,
@@ -793,49 +868,20 @@ class MetaflowWorkflow:
             input_paths = "%s/%s/%s" % (run_id, parent_step, parent_task_id)
 
         task_id = "temporal-%s-%d-%d" % (step_name, split_index, retry_count)
-        env_overrides = dict(node.get("env", {}))
-        env_overrides["METAFLOW_RUN_ID"] = run_id
-
-        inp = StepInput(
-            flow_name=cfg["flow_name"],
-            flow_file=cfg["flow_file"],
-            step_name=step_name,
-            run_id=run_id,
-            task_id=task_id,
-            input_paths=input_paths,
-            retry_count=retry_count,
-            max_retries=node.get("retries", 0),
-            split_index=split_index,
-            env_overrides=env_overrides,
-            params_json="",
-            metadata_type=cfg.get("metadata_type", "local"),
-            datastore_type=cfg.get("datastore_type", "local"),
-            environment_type=cfg.get("environment_type", "local"),
-            event_logger_type=cfg.get("event_logger_type", "nullSidecarLogger"),
-            monitor_type=cfg.get("monitor_type", "nullSidecarMonitor"),
-            code_package_url=(cfg.get("code_package") or {}).get("url", ""),
-            code_package_sha=(cfg.get("code_package") or {}).get("sha", ""),
-            code_package_metadata=(cfg.get("code_package") or {}).get("metadata", ""),
-            decorator_specs=node.get("decorator_specs", []),
-            runtime_cli_decorators=node.get("runtime_cli_decorators", []),
-            tags=cfg.get("tags", []),
-        )
-
-        retry_policy = RetryPolicy(
-            maximum_attempts=node.get("retries", 0) + 1,
-            initial_interval=timedelta(seconds=node.get("retry_delay_seconds", 120)),
-        )
+        inp = _make_step_input(cfg, node, step_name, run_id, task_id, input_paths, retry_count, split_index, {})
+        retry_policy = _make_retry_policy(node)
         timeout_seconds = node.get("timeout_seconds", 3600)
 
         out: StepOutput = await workflow.execute_activity(
             run_metaflow_step,
             inp,
             start_to_close_timeout=timedelta(seconds=timeout_seconds),
+            heartbeat_timeout=timedelta(seconds=60),
             retry_policy=retry_policy,
         )
 
-        # Record this step's task_id in the slice-local task_ids
         task_ids[step_name] = out.task_id
+        self._push_compensation(cfg, step_name, out.task_id)
 
         if node_type == "foreach":
             # Nested foreach: fan out the inner body steps in parallel
@@ -904,54 +950,25 @@ class MetaflowWorkflow:
                 break
 
             input_paths = _resolve_input_paths(current, node, run_id, task_ids, steps=steps)
-            # For the first step after a split, parent is the split step
-            # We need to look at in_funcs and find what's already in task_ids
-            # _resolve_input_paths handles this via the passed task_ids
-
             task_id = "temporal-%s-%d" % (current, retry_count)
-            env_overrides = dict(node.get("env", {}))
-            env_overrides["METAFLOW_RUN_ID"] = run_id
-
-            inp = StepInput(
-                flow_name=cfg["flow_name"],
-                flow_file=cfg["flow_file"],
-                step_name=current,
-                run_id=run_id,
-                task_id=task_id,
-                input_paths=input_paths,
-                retry_count=retry_count,
-                max_retries=node.get("retries", 0),
-                split_index=-1,
-                env_overrides=env_overrides,
-                params_json="",
-                metadata_type=cfg.get("metadata_type", "local"),
-                datastore_type=cfg.get("datastore_type", "local"),
-                environment_type=cfg.get("environment_type", "local"),
-                event_logger_type=cfg.get("event_logger_type", "nullSidecarLogger"),
-                monitor_type=cfg.get("monitor_type", "nullSidecarMonitor"),
-                code_package_url=(cfg.get("code_package") or {}).get("url", ""),
-                code_package_sha=(cfg.get("code_package") or {}).get("sha", ""),
-                code_package_metadata=(cfg.get("code_package") or {}).get("metadata", ""),
-                decorator_specs=node.get("decorator_specs", []),
-                runtime_cli_decorators=node.get("runtime_cli_decorators", []),
-            )
-
-            retry_policy = RetryPolicy(maximum_attempts=node.get("retries", 0) + 1)
+            inp = _make_step_input(cfg, node, current, run_id, task_id, input_paths, retry_count, -1, {})
+            retry_policy = _make_retry_policy(node)
             timeout_seconds = node.get("timeout_seconds", 3600)
 
             out: StepOutput = await workflow.execute_activity(
                 run_metaflow_step,
                 inp,
                 start_to_close_timeout=timedelta(seconds=timeout_seconds),
+                heartbeat_timeout=timedelta(seconds=60),
                 retry_policy=retry_policy,
             )
             task_ids[current] = out.task_id
+            self._push_compensation(cfg, current, out.task_id)
 
             out_funcs = node["out_funcs"]
             if not out_funcs:
                 break
             next_step = out_funcs[0]
-            # Check if next is join
             if steps[next_step]["type"] == "join":
                 break
             current = next_step
@@ -995,47 +1012,19 @@ class MetaflowWorkflow:
 
             input_paths = _resolve_input_paths(current, node, run_id, task_ids, steps=steps)
             task_id = "temporal-%s-%d" % (current, retry_count)
-            env_overrides = dict(node.get("env", {}))
-            env_overrides["METAFLOW_RUN_ID"] = run_id
-
-            inp = StepInput(
-                flow_name=cfg["flow_name"],
-                flow_file=cfg["flow_file"],
-                step_name=current,
-                run_id=run_id,
-                task_id=task_id,
-                input_paths=input_paths,
-                retry_count=retry_count,
-                max_retries=node.get("retries", 0),
-                split_index=-1,
-                env_overrides=env_overrides,
-                params_json="",
-                metadata_type=cfg.get("metadata_type", "local"),
-                datastore_type=cfg.get("datastore_type", "local"),
-                environment_type=cfg.get("environment_type", "local"),
-                event_logger_type=cfg.get("event_logger_type", "nullSidecarLogger"),
-                monitor_type=cfg.get("monitor_type", "nullSidecarMonitor"),
-                code_package_url=(cfg.get("code_package") or {}).get("url", ""),
-                code_package_sha=(cfg.get("code_package") or {}).get("sha", ""),
-                code_package_metadata=(cfg.get("code_package") or {}).get("metadata", ""),
-                decorator_specs=node.get("decorator_specs", []),
-                runtime_cli_decorators=node.get("runtime_cli_decorators", []),
-                tags=cfg.get("tags", []),
-            )
-
-            retry_policy = RetryPolicy(
-                maximum_attempts=node.get("retries", 0) + 1,
-                initial_interval=timedelta(seconds=node.get("retry_delay_seconds", 120)),
-            )
+            inp = _make_step_input(cfg, node, current, run_id, task_id, input_paths, retry_count, -1, {})
+            retry_policy = _make_retry_policy(node)
             timeout_seconds = node.get("timeout_seconds", 3600)
 
             out: StepOutput = await workflow.execute_activity(
                 run_metaflow_step,
                 inp,
                 start_to_close_timeout=timedelta(seconds=timeout_seconds),
+                heartbeat_timeout=timedelta(seconds=60),
                 retry_policy=retry_policy,
             )
             task_ids[current] = out.task_id
+            self._push_compensation(cfg, current, out.task_id)
 
             out_funcs = node["out_funcs"]
             if not out_funcs:
@@ -1184,6 +1173,16 @@ class WorkerUtils:
     async def run_worker(config: dict):
         """Start the Temporal worker for this flow."""
         client = await Client.connect(config["temporal_host"])
+
+        shutdown_event = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, shutdown_event.set)
+            except (NotImplementedError, RuntimeError):
+                # signal handlers are not available on all platforms (e.g. Windows)
+                pass
+
         async with Worker(
             client,
             task_queue=config["task_queue"],
@@ -1194,11 +1193,29 @@ class WorkerUtils:
             ),
         ):
             print("Worker started. Listening on queue: %s" % config["task_queue"])
+
             # Register a Temporal Schedule if @schedule decorator is present
             schedule_cfg = config.get("schedule")
             if schedule_cfg and schedule_cfg.get("cron"):
                 await WorkerUtils._register_schedule(client, config, schedule_cfg)
-            await asyncio.Event().wait()
+
+            # Start trigger_on_finish polling if upstream flows are configured
+            triggers = config.get("trigger_on_finish", [])
+            trigger_task = None
+            if triggers:
+                trigger_task = asyncio.ensure_future(
+                    WorkerUtils._poll_trigger_on_finish(client, config, triggers)
+                )
+
+            await shutdown_event.wait()
+            print("Worker shutting down gracefully.")
+
+            if trigger_task is not None:
+                trigger_task.cancel()
+                try:
+                    await trigger_task
+                except asyncio.CancelledError:
+                    pass
 
     @staticmethod
     async def _register_schedule(client: Client, config: dict, schedule_cfg: dict):
@@ -1241,6 +1258,61 @@ class WorkerUtils:
         except Exception as e:
             # Schedule already exists — log and continue
             print("Note: Schedule '%s' already exists: %s" % (schedule_id, e))
+
+    @staticmethod
+    async def _poll_trigger_on_finish(client: Client, config: dict, triggers: list):
+        """Poll for completed runs of upstream flows and auto-trigger this flow.
+
+        Checks each upstream flow listed in ``triggers`` every 30 seconds.
+        When a new successful run is detected (one we haven't seen before),
+        triggers a new run of this flow.
+
+        Upstream flows are identified by the Temporal workflow ID prefix
+        ``<flow_name_lower>-``.  Only workflows that completed successfully
+        since the last check are used as triggers.
+        """
+        seen_run_ids: set = set()
+
+        while True:
+            await asyncio.sleep(30)
+            for trigger in triggers:
+                upstream_name = trigger.get("flow", "")
+                if not upstream_name:
+                    continue
+                prefix = "%s-" % upstream_name.lower()
+                try:
+                    async for wf in await client.list_workflows(
+                        query='WorkflowType="MetaflowWorkflow" AND ExecutionStatus="Completed"'
+                    ):
+                        wf_id = wf.id
+                        if not wf_id.startswith(prefix):
+                            continue
+                        if wf_id in seen_run_ids:
+                            continue
+                        seen_run_ids.add(wf_id)
+                        new_id = "%s-%s" % (config["flow_name"].lower(), uuid.uuid4().hex[:8])
+                        try:
+                            result = await client.execute_workflow(
+                                MetaflowWorkflow.run,
+                                {"config": config, "params": {}},
+                                id=new_id,
+                                task_queue=config["task_queue"],
+                            )
+                            print(
+                                "trigger_on_finish: triggered by %s -> run ID: %s"
+                                % (wf_id, result)
+                            )
+                        except Exception as trigger_err:
+                            print(
+                                "trigger_on_finish: failed to trigger for %s: %s"
+                                % (wf_id, trigger_err)
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as poll_err:
+                    print(
+                        "trigger_on_finish: poll error for %s: %s" % (upstream_name, poll_err)
+                    )
 
     @staticmethod
     async def trigger(config: dict, params: dict) -> str:
