@@ -115,9 +115,7 @@ class Temporal:
     def _build_config(self) -> dict:
         datastore_root = getattr(self.flow_datastore, "datastore_root", None) or ""
         # Use project-aware flow name if @project is present
-        flow_name = (
-            self._effective_flow_name
-        )
+        flow_name = self._effective_flow_name
         # Merge user tags with auto-added project tags
         tags = list(self.tags)
         if self._project_info:
@@ -331,9 +329,7 @@ class Temporal:
             env.update(env_deco[0].attributes.get("vars", {}))
 
         # Use project-aware flow name if @project is present
-        flow_name = (
-            self._effective_flow_name
-        )
+        flow_name = self._effective_flow_name
         env["METAFLOW_FLOW_NAME"] = flow_name
         env["METAFLOW_STEP_NAME"] = node.name
         env["METAFLOW_OWNER"] = self.username or ""

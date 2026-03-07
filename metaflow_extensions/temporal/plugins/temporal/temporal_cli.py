@@ -176,6 +176,28 @@ def create(
             )
 
 
+async def _do_trigger(temporal_host, flow_name, task_queue, params, workflow_timeout):
+    """Submit a MetaflowWorkflow to Temporal and return (run_id, workflow_id).
+
+    The worker must already be running; this only submits the workflow for
+    execution.  The worker uses its own embedded CONFIG (``_use_embedded_config``
+    sentinel), so no config needs to be transmitted here.
+    """
+    from temporalio.client import Client
+
+    client = await Client.connect(temporal_host)
+    workflow_id = "%s-%s" % (flow_name.lower(), uuid.uuid4().hex[:8])
+    execution_timeout = timedelta(seconds=workflow_timeout) if workflow_timeout else None
+    await client.start_workflow(
+        "MetaflowWorkflow",
+        {"config": None, "params": params, "_use_embedded_config": True},
+        id=workflow_id,
+        task_queue=task_queue,
+        execution_timeout=execution_timeout,
+    )
+    return "temporal-%s" % workflow_id, workflow_id
+
+
 @temporal.command(help="Trigger a run for a previously compiled Temporal worker.")
 @click.pass_obj
 @click.option("--name", default=None, help="Flow name (defaults to graph name)")
@@ -218,28 +240,6 @@ def create(
     default=False,
     help="Target the @project production branch (must match the compiled worker).",
 )
-async def _do_trigger(temporal_host, flow_name, task_queue, params, workflow_timeout):
-    """Submit a MetaflowWorkflow to Temporal and return (run_id, workflow_id).
-
-    The worker must already be running; this only submits the workflow for
-    execution.  The worker uses its own embedded CONFIG (``_use_embedded_config``
-    sentinel), so no config needs to be transmitted here.
-    """
-    from temporalio.client import Client
-
-    client = await Client.connect(temporal_host)
-    workflow_id = "%s-%s" % (flow_name.lower(), uuid.uuid4().hex[:8])
-    execution_timeout = timedelta(seconds=workflow_timeout) if workflow_timeout else None
-    await client.start_workflow(
-        "MetaflowWorkflow",
-        {"config": None, "params": params, "_use_embedded_config": True},
-        id=workflow_id,
-        task_queue=task_queue,
-        execution_timeout=execution_timeout,
-    )
-    return "temporal-%s" % workflow_id, workflow_id
-
-
 def trigger(
     obj,
     name,
@@ -274,41 +274,6 @@ def trigger(
             )
 
 
-@temporal.command(help="Resume a previously failed or incomplete Temporal workflow run.")
-@click.pass_obj
-@click.argument("run_id")
-@click.option("--name", default=None, help="Flow name (defaults to graph name)")
-@click.option("--task-queue", default=None, help="Temporal task queue name")
-@click.option(
-    "--temporal-host",
-    default="localhost:7233",
-    show_default=True,
-    help="Temporal server host:port",
-)
-@click.option(
-    "--workflow-timeout",
-    default=None,
-    type=int,
-    help="Maximum seconds a workflow execution may run (default: no limit)",
-)
-@click.option(
-    "--run-param",
-    "run_params",
-    multiple=True,
-    default=None,
-    help="Flow parameter as key=value (override for the resumed run, repeatable).",
-)
-@click.option(
-    "--branch",
-    default=None,
-    help="@project branch name (must match the compiled worker's branch).",
-)
-@click.option(
-    "--production",
-    is_flag=True,
-    default=False,
-    help="Target the @project production branch (must match the compiled worker).",
-)
 async def _do_resume(temporal_host, flow_name, run_id, task_queue, params, workflow_timeout):
     """Resume a previously started Temporal workflow and wait for completion.
 
@@ -357,6 +322,41 @@ async def _do_resume(temporal_host, flow_name, run_id, task_queue, params, workf
     return result
 
 
+@temporal.command(help="Resume a previously failed or incomplete Temporal workflow run.")
+@click.pass_obj
+@click.argument("run_id")
+@click.option("--name", default=None, help="Flow name (defaults to graph name)")
+@click.option("--task-queue", default=None, help="Temporal task queue name")
+@click.option(
+    "--temporal-host",
+    default="localhost:7233",
+    show_default=True,
+    help="Temporal server host:port",
+)
+@click.option(
+    "--workflow-timeout",
+    default=None,
+    type=int,
+    help="Maximum seconds a workflow execution may run (default: no limit)",
+)
+@click.option(
+    "--run-param",
+    "run_params",
+    multiple=True,
+    default=None,
+    help="Flow parameter as key=value (override for the resumed run, repeatable).",
+)
+@click.option(
+    "--branch",
+    default=None,
+    help="@project branch name (must match the compiled worker's branch).",
+)
+@click.option(
+    "--production",
+    is_flag=True,
+    default=False,
+    help="Target the @project production branch (must match the compiled worker).",
+)
 def resume(obj, run_id, name, task_queue, temporal_host, workflow_timeout, run_params, branch, production):
     """Resume a previously failed or incomplete Temporal workflow run.
 
