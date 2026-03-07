@@ -280,6 +280,33 @@ Forward a Metaflow namespace to every step subprocess:
 python my_flow.py temporal create --output my_flow_worker.py --namespace production
 ```
 
+### Resource hints
+
+`@resources` on a step forwards CPU, memory, and GPU hints to the underlying compute backend
+via `--with=resources:cpu=N,memory=M,gpu=G`:
+
+```python
+class MyFlow(FlowSpec):
+    @resources(cpu=4, memory=8000, gpu=1)
+    @step
+    def train(self):
+        ...
+```
+
+### Event-based triggers (`@trigger` / `@trigger_on_finish`)
+
+Decorate your flow to automatically wire Temporal signals as triggers.
+
+```python
+# Send a Temporal signal to start this flow when a named event fires
+@trigger(event="data.ready")
+class MyFlow(FlowSpec):
+    ...
+```
+
+The generated worker registers a signal handler for `data.ready`; send the signal via the
+Temporal SDK or CLI to start the workflow.
+
 ### Auto-trigger on upstream completion
 
 Decorate your flow with `@trigger_on_finish` and the worker will poll for completed upstream
