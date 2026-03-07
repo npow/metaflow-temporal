@@ -1,6 +1,9 @@
+import asyncio
 import json
 import os
 import sys
+import uuid
+from datetime import timedelta
 
 from metaflow._vendor import click
 from metaflow.util import get_username
@@ -44,6 +47,15 @@ def _resolve_task_queue(obj, task_queue, branch=None, production=False):
 @click.group()
 def cli():
     pass
+
+
+def _parse_run_params(run_params) -> dict:
+    """Convert ['key=value', ...] tuples from --run-param flags into a dict."""
+    params = {}
+    for kv in run_params:
+        k, _, v = kv.partition("=")
+        params[k.strip()] = v.strip()
+    return params
 
 
 @cli.group(help="Commands related to Temporal orchestration.")
@@ -218,17 +230,9 @@ def trigger(
     production,
 ):
     """Trigger a Temporal workflow run and write run info for the Deployer API."""
-    import asyncio
-    import uuid
-    from datetime import timedelta
-
     flow_name = name or obj.graph.name
     task_queue = _resolve_task_queue(obj, task_queue, branch=branch, production=production)
-
-    params = {}
-    for kv in run_params:
-        k, _, v = kv.partition("=")
-        params[k.strip()] = v.strip()
+    params = _parse_run_params(run_params)
 
     # Build a minimal config so we can trigger directly via the Temporal client.
     # The worker must already be running; we only need to submit the workflow.
@@ -315,20 +319,13 @@ def resume(obj, run_id, name, task_queue, temporal_host, workflow_timeout, run_p
     RUN_ID is the Metaflow run ID of the run to resume (e.g. temporal-myflow-abc123).
     Completed steps are skipped; only steps that did not finish will re-execute.
     """
-    import asyncio
-
     flow_name = name or obj.graph.name
     task_queue = _resolve_task_queue(obj, task_queue, branch=branch, production=production)
-
-    params = {}
-    for kv in run_params:
-        k, _, v = kv.partition("=")
-        params[k.strip()] = v.strip()
+    params = _parse_run_params(run_params)
 
     async def _resume():
         import metaflow
         from temporalio.client import Client
-        from datetime import timedelta
 
         # Discover which steps completed by inspecting the Metaflow datastore.
         try:
@@ -346,7 +343,6 @@ def resume(obj, run_id, name, task_queue, temporal_host, workflow_timeout, run_p
             resume_state = {}
 
         client = await Client.connect(temporal_host)
-        import uuid
         new_workflow_id = "%s-resume-%s" % (flow_name.lower(), uuid.uuid4().hex[:8])
         execution_timeout = timedelta(seconds=workflow_timeout) if workflow_timeout else None
 

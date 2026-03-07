@@ -19,6 +19,22 @@ from .exception import TemporalException
 
 WORKER_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "worker_template.mustache")
 
+# Decorators that must NOT be forwarded as --with specs to step subprocesses.
+# These decorators either have no meaning inside a step subprocess (schedule,
+# project, trigger) or are already handled via runtime_step_cli hooks (sandbox,
+# daytona, e2b, boxlite) — forwarding them would cause double step_init.
+_EXCLUDED_DECORATOR_SPECS = frozenset({
+    "temporal_internal",
+    "retry", "timeout", "environment",
+    "project", "trigger", "trigger_on_finish",
+    "schedule", "card", "catch",
+    "sandbox", "daytona", "e2b", "boxlite",
+})
+
+# Default values for compiled step config (also used in worker_utils constants).
+_DEFAULT_STEP_TIMEOUT_SECONDS = 3600   # 1 hour
+_DEFAULT_RETRY_DELAY_SECONDS = 120     # 2 minutes
+
 
 class Temporal:
     def __init__(
@@ -63,14 +79,20 @@ class Temporal:
         # Compute @project info and derive the effective flow name.
         # Must happen after all self.* assignments above.
         self._project_info = self._get_project()
-        effective_name = (
-            self._project_info["flow_name"] if self._project_info else name
-        )
         # Sanitize dots to hyphens for the task queue name.
         self.task_queue = task_queue or (
-            "metaflow-%s" % effective_name.lower().replace(".", "-")
+            "metaflow-%s" % self._effective_flow_name.lower().replace(".", "-")
         )
         self._code_package_info = None
+
+    @property
+    def _effective_flow_name(self) -> str:
+        """The flow name to use for datastore paths and the task queue.
+
+        Returns the project-aware name (e.g. ``myproject.prod.TrainFlow``) when
+        the flow carries ``@project``, otherwise the plain class name.
+        """
+        return self._project_info["flow_name"] if self._project_info else self.name
 
     def compile(self) -> str:
         self._validate()
@@ -94,7 +116,7 @@ class Temporal:
         datastore_root = getattr(self.flow_datastore, "datastore_root", None) or ""
         # Use project-aware flow name if @project is present
         flow_name = (
-            self._project_info["flow_name"] if self._project_info else self.name
+            self._effective_flow_name
         )
         # Merge user tags with auto-added project tags
         tags = list(self.tags)
@@ -232,11 +254,7 @@ class Temporal:
             name = getattr(d, "name", None)
             if not name:
                 continue
-            if name in ("temporal_internal",):
-                continue
-            if name in ("retry", "timeout", "environment", "project", "trigger",
-                        "trigger_on_finish", "schedule", "card", "catch",
-                        "sandbox", "daytona", "e2b", "boxlite"):
+            if name in _EXCLUDED_DECORATOR_SPECS:
                 continue
             try:
                 spec = d.make_decorator_spec()
@@ -314,7 +332,7 @@ class Temporal:
 
         # Use project-aware flow name if @project is present
         flow_name = (
-            self._project_info["flow_name"] if self._project_info else self.flow.name
+            self._effective_flow_name
         )
         env["METAFLOW_FLOW_NAME"] = flow_name
         env["METAFLOW_STEP_NAME"] = node.name
@@ -347,7 +365,7 @@ class Temporal:
                     return limit
         except Exception:
             pass
-        return 3600  # 1-hour default
+        return _DEFAULT_STEP_TIMEOUT_SECONDS
 
     def _get_retries(self, node) -> int:
         for deco in node.decorators:
@@ -361,7 +379,7 @@ class Temporal:
             if deco.name == "retry":
                 minutes = float(deco.attributes.get("minutes_between_retries", 2))
                 return int(minutes * 60)
-        return 120  # 2-minute default
+        return _DEFAULT_RETRY_DELAY_SECONDS
 
     def _get_schedule(self) -> Optional[dict]:
         """Extract @schedule decorator config from flow-level decorators."""

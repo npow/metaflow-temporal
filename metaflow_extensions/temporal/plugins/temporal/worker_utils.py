@@ -22,6 +22,23 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError, CancelledError as TemporalCancelledError
 from temporalio.worker import Worker
 
+# ---------------------------------------------------------------------------
+# Tuneable constants
+# ---------------------------------------------------------------------------
+
+# How often the heartbeat loop pings Temporal to keep the activity lease alive.
+_HEARTBEAT_INTERVAL_SECONDS = 20
+
+# Maximum silence before Temporal considers an activity dead.  Must be greater
+# than _HEARTBEAT_INTERVAL_SECONDS so a live activity never times out.
+_HEARTBEAT_TIMEOUT_SECONDS = 60
+
+# Default activity timeout when no @timeout decorator is present.
+_DEFAULT_STEP_TIMEOUT_SECONDS = 3600  # 1 hour
+
+# Default delay between retries when no @retry(minutes_between_retries=N) is set.
+_DEFAULT_RETRY_DELAY_SECONDS = 120  # 2 minutes
+
 
 # ---------------------------------------------------------------------------
 # Data types shared between workflow and activities
@@ -398,7 +415,7 @@ async def _run_subprocess(cmd: list, env: dict) -> tuple:
 
     async def _hb():
         while True:
-            await asyncio.sleep(20)
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
             try:
                 activity.heartbeat()
             except TemporalCancelledError:
@@ -633,11 +650,11 @@ def _make_step_input(
     )
 
 
-def _make_retry_policy(node: dict) -> "RetryPolicy":
+def _make_retry_policy(node: dict) -> RetryPolicy:
     """Build a Temporal RetryPolicy from a compiled step node config."""
     return RetryPolicy(
         maximum_attempts=node.get("retries", 0) + 1,
-        initial_interval=timedelta(seconds=node.get("retry_delay_seconds", 120)),
+        initial_interval=timedelta(seconds=node.get("retry_delay_seconds", _DEFAULT_RETRY_DELAY_SECONDS)),
     )
 
 
@@ -769,13 +786,13 @@ class MetaflowWorkflow:
 
         inp = _make_step_input(cfg, node, step_name, run_id, task_id, input_paths, retry_count, split_index, params)
         retry_policy = _make_retry_policy(node)
-        timeout_seconds = node.get("timeout_seconds", 3600)
+        timeout_seconds = node.get("timeout_seconds", _DEFAULT_STEP_TIMEOUT_SECONDS)
 
         out: StepOutput = await workflow.execute_activity(
             run_metaflow_step,
             inp,
             start_to_close_timeout=timedelta(seconds=timeout_seconds),
-            heartbeat_timeout=timedelta(seconds=60),
+            heartbeat_timeout=timedelta(seconds=_HEARTBEAT_TIMEOUT_SECONDS),
             retry_policy=retry_policy,
         )
 
@@ -899,13 +916,13 @@ class MetaflowWorkflow:
         task_id = "temporal-%s-%d-%d" % (step_name, split_index, retry_count)
         inp = _make_step_input(cfg, node, step_name, run_id, task_id, input_paths, retry_count, split_index, {})
         retry_policy = _make_retry_policy(node)
-        timeout_seconds = node.get("timeout_seconds", 3600)
+        timeout_seconds = node.get("timeout_seconds", _DEFAULT_STEP_TIMEOUT_SECONDS)
 
         out: StepOutput = await workflow.execute_activity(
             run_metaflow_step,
             inp,
             start_to_close_timeout=timedelta(seconds=timeout_seconds),
-            heartbeat_timeout=timedelta(seconds=60),
+            heartbeat_timeout=timedelta(seconds=_HEARTBEAT_TIMEOUT_SECONDS),
             retry_policy=retry_policy,
         )
 
@@ -959,7 +976,7 @@ class MetaflowWorkflow:
         run_id: str,
         retry_count: int,
         task_ids: dict,
-    ) -> StepOutput:
+    ) -> "StepOutput":
         """Run a single branch step as a Temporal activity and record its task_id.
 
         Shared by both branch traversal methods to avoid duplicating the
@@ -970,13 +987,13 @@ class MetaflowWorkflow:
         input_paths = _resolve_input_paths(step_name, node, run_id, task_ids, steps=steps)
         task_id = "temporal-%s-%d" % (step_name, retry_count)
         inp = _make_step_input(cfg, node, step_name, run_id, task_id, input_paths, retry_count, -1, {})
-        timeout_seconds = node.get("timeout_seconds", 3600)
+        timeout_seconds = node.get("timeout_seconds", _DEFAULT_STEP_TIMEOUT_SECONDS)
 
         out: StepOutput = await workflow.execute_activity(
             run_metaflow_step,
             inp,
             start_to_close_timeout=timedelta(seconds=timeout_seconds),
-            heartbeat_timeout=timedelta(seconds=60),
+            heartbeat_timeout=timedelta(seconds=_HEARTBEAT_TIMEOUT_SECONDS),
             retry_policy=_make_retry_policy(node),
         )
         task_ids[step_name] = out.task_id
