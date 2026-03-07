@@ -53,8 +53,8 @@ jobs:
           EOF
 
       - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
-          metaflow-ref: npow/corral-devstack
         with:
+          metaflow-ref: npow/corral-devstack
           extra-install: "."
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
           ux-test-config: |
