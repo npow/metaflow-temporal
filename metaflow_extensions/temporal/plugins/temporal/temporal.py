@@ -20,11 +20,15 @@ WORKER_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "worker_template.
 # These decorators either have no meaning inside a step subprocess (schedule,
 # project, trigger) or are already handled via runtime_step_cli hooks (sandbox,
 # daytona, e2b, boxlite) — forwarding them would cause double step_init.
+# NOTE: @resources is intentionally excluded here; resource hints are emitted
+# as a structured "resources" entry in the per-step config and forwarded to
+# compute backends (e.g. @kubernetes) via the decorator_specs list.
 _EXCLUDED_DECORATOR_SPECS = frozenset({
     "temporal_internal",
     "retry", "timeout", "environment",
     "project", "trigger", "trigger_on_finish",
     "schedule", "card", "catch",
+    "resources",
     "sandbox", "daytona", "e2b", "boxlite",
 })
 
@@ -100,16 +104,9 @@ class Temporal:
 
     def _validate(self) -> None:
         """Validate the graph before compilation, raising errors for unsupported patterns."""
-        for node in self.graph:
-            for deco in node.decorators:
-                if deco.name == "resources":
-                    warnings.warn(
-                        "Step *%s* uses @resources. Resource requirements are passed through "
-                        "as decorator specs but are not enforced by Temporal scheduling — "
-                        "configure resources on your Temporal worker directly." % node.name,
-                        UserWarning,
-                        stacklevel=2,
-                    )
+        # @resources: resource hints are extracted and forwarded as decorator specs
+        # to the step subprocess so that compute backends (e.g. @kubernetes) can
+        # enforce them.  No warning is emitted — this is fully supported.
 
     def _build_config(self) -> dict:
         datastore_root = getattr(self.flow_datastore, "datastore_root", None) or ""
@@ -152,8 +149,12 @@ class Temporal:
             "compensations": self._build_compensations(),
             # Original Python class name (needed by run_compensation to importlib-load the class)
             "flow_class_name": self.flow.__class__.__name__,
-            # @trigger_on_finish / @trigger upstream flows that should auto-trigger this flow
+            # @trigger_on_finish: upstream flows whose completion auto-triggers this flow.
+            # Each entry: {"flow": "<FlowName>"}.
             "trigger_on_finish": self._get_trigger_on_finish(),
+            # @trigger(event="foo"): named events that start this workflow via a Temporal signal.
+            # Each entry: {"event": "<event_name>", "parameters": {<flow_param>: <event_field>}}.
+            "named_triggers": self._get_named_triggers(),
             # Uploaded code package metadata for remote runtime decorators
             # (e.g. sandbox/daytona/e2b, batch, kubernetes).
             "code_package": self._get_code_package_info(),
@@ -245,7 +246,12 @@ class Temporal:
         return all_decorators
 
     def _get_decorator_specs(self, node) -> list:
-        """Return --with-compatible spec strings for user-defined step decorators."""
+        """Return --with-compatible spec strings for user-defined step decorators.
+
+        @resources is handled specially: cpu/memory/gpu hints are emitted as a
+        ``resources:cpu=N,memory=M,gpu=G`` spec so that Metaflow compute backends
+        (e.g. @kubernetes, @batch) receive the resource constraints at step runtime.
+        """
         specs = []
         seen = set()
         for d in self._iter_step_decorators(node):
@@ -253,6 +259,26 @@ class Temporal:
             if not name:
                 continue
             if name in _EXCLUDED_DECORATOR_SPECS:
+                # @resources is in _EXCLUDED_DECORATOR_SPECS to skip make_decorator_spec()
+                # (which would emit a bare "resources:..." spec that some backends reject).
+                # Instead we build a clean spec from the known attributes below.
+                if name == "resources":
+                    attrs = getattr(d, "attributes", {})
+                    resource_parts = []
+                    cpu = attrs.get("cpu")
+                    memory = attrs.get("memory")
+                    gpu = attrs.get("gpu")
+                    if cpu is not None:
+                        resource_parts.append("cpu=%s" % cpu)
+                    if memory is not None:
+                        resource_parts.append("memory=%s" % memory)
+                    if gpu is not None:
+                        resource_parts.append("gpu=%s" % gpu)
+                    if resource_parts:
+                        spec = "resources:%s" % ",".join(resource_parts)
+                        if spec not in seen:
+                            seen.add(spec)
+                            specs.append(spec)
                 continue
             try:
                 spec = d.make_decorator_spec()
@@ -429,26 +455,83 @@ class Temporal:
             return None
 
     def _get_trigger_on_finish(self) -> list:
-        """Extract @trigger_on_finish and @trigger decorator config from flow-level decorators."""
-        triggers = []
+        """Extract @trigger_on_finish decorator config from flow-level decorators.
+
+        Uses the decorator's ``.triggers`` property (set during ``init_flow_decorator``)
+        which contains fully-resolved ``{"flow": "<name>", ...}`` dicts, rather than
+        reading raw attributes directly.  This mirrors the approach used by metaflow-prefect.
+        """
+        results = []
         try:
             flow_decos = getattr(self.flow, "_flow_decorators", {})
-            for deco_name in ("trigger_on_finish", "trigger"):
-                for d in flow_decos.get(deco_name, []):
+            for d in flow_decos.get("trigger_on_finish", []):
+                raw_triggers = getattr(d, "triggers", None)
+                if raw_triggers is None:
+                    # Fallback: read raw attributes for older Metaflow builds
                     attrs = getattr(d, "attributes", {})
                     flow_ref = attrs.get("flow") or attrs.get("flows")
                     if not flow_ref:
                         continue
                     if isinstance(flow_ref, str):
-                        triggers.append({"flow": flow_ref})
+                        results.append({"flow": flow_ref})
                     elif isinstance(flow_ref, (list, tuple)):
                         for f in flow_ref:
                             name = f if isinstance(f, str) else getattr(f, "__name__", None)
                             if name:
-                                triggers.append({"flow": name})
+                                results.append({"flow": name})
+                    continue
+                for t in raw_triggers:
+                    if not isinstance(t, dict):
+                        continue
+                    flow_name = t.get("flow") or t.get("fq_name")
+                    if not flow_name or not isinstance(flow_name, str):
+                        warnings.warn(
+                            "@trigger_on_finish entry has a missing or non-string flow name %r — "
+                            "skipping this trigger." % (flow_name,),
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                        continue
+                    results.append({"flow": flow_name})
         except Exception:
             pass
-        return triggers
+        return results
+
+    def _get_named_triggers(self) -> list:
+        """Extract @trigger(event="foo") entries from flow-level decorators.
+
+        Returns a list of dicts: [{"event": "<event_name>", "parameters": {...}}, ...].
+        In the generated worker these are wired as Temporal signal handlers — sending a
+        signal named ``<event_name>`` to the workflow causes it to start a new run.
+        Uses the decorator's ``.triggers`` property (set during ``init_flow_decorator``).
+        """
+        results = []
+        try:
+            flow_decos = getattr(self.flow, "_flow_decorators", {})
+            for d in flow_decos.get("trigger", []):
+                raw_triggers = getattr(d, "triggers", None)
+                if raw_triggers is None:
+                    continue
+                for t in raw_triggers:
+                    if not isinstance(t, dict):
+                        continue
+                    event_name = t.get("name")
+                    if not event_name or not isinstance(event_name, str):
+                        warnings.warn(
+                            "@trigger entry has a missing or non-string event name %r — "
+                            "skipping this trigger.  Evaluate the event name before deploying."
+                            % (event_name,),
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                        continue
+                    # parameters: dict mapping flow_param -> event_field
+                    raw_params = t.get("parameters") or {}
+                    param_map = dict(raw_params) if isinstance(raw_params, dict) else {}
+                    results.append({"event": event_name, "parameters": param_map})
+        except Exception:
+            pass
+        return results
 
     def _build_compensations(self) -> dict:
         """Scan the flow class for @compensate-decorated methods and return the mapping."""

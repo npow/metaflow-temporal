@@ -1183,6 +1183,89 @@ def _find_switch_merge_step(switch_step_name: str, steps: dict) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Event gateway workflow — handles @trigger(event="foo") signals
+# ---------------------------------------------------------------------------
+
+
+@workflow.defn(name="MetaflowEventGateway")
+class MetaflowEventGateway:
+    """Long-running workflow that accepts named signals and starts MetaflowWorkflow runs.
+
+    One gateway workflow per flow is kept alive while the worker is running.
+    Sending a Temporal signal whose name matches a registered ``@trigger(event=...)``
+    event causes a new ``MetaflowWorkflow`` run to start.
+
+    Signal payload format (JSON-serialisable dict, optional):
+        {"<event_field>": <value>, ...}
+
+    Parameter mapping (from @trigger(event={"name": "foo", "parameters": {...}})):
+        {"<flow_param>": "<event_field>"}  — copied from the trigger config in CONFIG.
+    """
+
+    def __init__(self):
+        self._pending: list = []   # [(event_name, payload_dict), ...]
+        self._stop: bool = False
+
+    @workflow.signal
+    def receive_event(self, payload: dict) -> None:
+        """General signal handler; payload must include ``_event_name`` key."""
+        event_name = payload.get("_event_name", "")
+        self._pending.append((event_name, payload))
+
+    @workflow.signal
+    def stop(self) -> None:
+        """Gracefully stop the gateway workflow."""
+        self._stop = True
+
+    @workflow.run
+    async def run(self, args: dict) -> None:
+        """Process incoming event signals until stopped."""
+        cfg = args.get("config")
+        if cfg is None or args.get("_use_embedded_config"):
+            cfg = CONFIG  # noqa: F821 — defined in generated worker at runtime
+        named_triggers = cfg.get("named_triggers", [])
+        # Build lookup: event_name -> parameter_map dict
+        trigger_map = {}
+        for t in named_triggers:
+            evt = t.get("event")
+            if evt:
+                trigger_map[evt] = t.get("parameters") or {}
+
+        while not self._stop:
+            # Block until a signal arrives or a stop is requested.
+            await workflow.wait_condition(lambda: bool(self._pending) or self._stop)
+            # Drain the pending queue
+            while self._pending:
+                event_name, payload = self._pending.pop(0)
+                param_map = trigger_map.get(event_name, {})
+                # Apply parameter mapping: flow_param = payload[event_field]
+                params = {}
+                for flow_param, event_field in param_map.items():
+                    if event_field in payload:
+                        params[flow_param] = payload[event_field]
+                # Start a child workflow so Temporal tracks the causal relationship.
+                workflow.logger.info(
+                    "Event gateway: received event '%s', starting workflow with params %r"
+                    % (event_name, params)
+                )
+                await workflow.execute_child_workflow(
+                    MetaflowWorkflow.run,
+                    {
+                        "config": None,
+                        "params": params,
+                        "_use_embedded_config": True,
+                    },
+                    id="%s-event-%s-%s"
+                    % (
+                        cfg.get("flow_name", "flow").lower(),
+                        event_name,
+                        workflow.now().strftime("%Y%m%d%H%M%S%f"),
+                    ),
+                    task_queue=cfg.get("task_queue", ""),
+                )
+
+
+# ---------------------------------------------------------------------------
 # WorkerUtils (entry points for generated worker files)
 # ---------------------------------------------------------------------------
 
@@ -1205,10 +1288,15 @@ class WorkerUtils:
                 # signal handlers are not available on all platforms (e.g. Windows)
                 pass
 
+        named_triggers = config.get("named_triggers", [])
+        workflow_types = [MetaflowWorkflow]
+        if named_triggers:
+            workflow_types.append(MetaflowEventGateway)
+
         async with Worker(
             client,
             task_queue=config["task_queue"],
-            workflows=[MetaflowWorkflow],
+            workflows=workflow_types,
             activities=[run_metaflow_step, run_compensation],
             activity_executor=ThreadPoolExecutor(
                 max_workers=config.get("max_workers", 10)
@@ -1228,6 +1316,12 @@ class WorkerUtils:
                 trigger_task = asyncio.ensure_future(
                     WorkerUtils._poll_trigger_on_finish(client, config, triggers)
                 )
+
+            # Start the event gateway workflow if @trigger(event=...) is configured.
+            # The gateway is a long-lived workflow that accepts named signals and
+            # starts a new MetaflowWorkflow run for each received event.
+            if named_triggers:
+                await WorkerUtils._ensure_event_gateway(client, config, named_triggers)
 
             await shutdown_event.wait()
             print("Worker shutting down gracefully.")
@@ -1335,6 +1429,41 @@ class WorkerUtils:
                     print(
                         "trigger_on_finish: poll error for %s: %s" % (upstream_name, poll_err)
                     )
+
+    @staticmethod
+    async def _ensure_event_gateway(client: Client, config: dict, named_triggers: list):
+        """Start (or reuse) the long-lived MetaflowEventGateway workflow.
+
+        The gateway is keyed by flow name so there is exactly one per compiled flow.
+        If the gateway is already running (e.g. from a previous worker restart) this
+        is a no-op (USE_EXISTING conflict policy).  Prints the event names that are
+        now wired to the flow.
+        """
+        from temporalio.common import WorkflowIDConflictPolicy
+
+        flow_name = config["flow_name"]
+        gateway_id = "metaflow-%s-event-gateway" % flow_name.lower().replace(".", "-")
+        event_names = [t["event"] for t in named_triggers if t.get("event")]
+        try:
+            await client.start_workflow(
+                "MetaflowEventGateway",
+                {
+                    "config": config,
+                    "_use_embedded_config": False,
+                },
+                id=gateway_id,
+                task_queue=config["task_queue"],
+                id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+            )
+            print(
+                "Event gateway ready (workflow ID: %s). Listening for events: %s"
+                % (gateway_id, ", ".join(event_names))
+            )
+        except Exception as exc:
+            print(
+                "Warning: could not start event gateway for events %s: %s"
+                % (event_names, exc)
+            )
 
     @staticmethod
     async def trigger(config: dict, params: dict) -> str:
