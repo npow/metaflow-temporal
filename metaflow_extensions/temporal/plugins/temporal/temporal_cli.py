@@ -75,6 +75,12 @@ def temporal(obj):
     help="Temporal server host:port",
 )
 @click.option(
+    "--temporal-namespace",
+    default="default",
+    show_default=True,
+    help="Temporal server namespace",
+)
+@click.option(
     "--max-workers",
     default=10,
     show_default=True,
@@ -111,6 +117,7 @@ def create(
     output,
     task_queue,
     temporal_host,
+    temporal_namespace,
     max_workers,
     tags,
     namespace,
@@ -139,6 +146,7 @@ def create(
         max_workers=max_workers,
         task_queue=task_queue,
         temporal_host=temporal_host,
+        temporal_namespace=temporal_namespace,
         branch=branch,
         production=production,
         workflow_timeout_seconds=workflow_timeout,
@@ -176,7 +184,7 @@ def create(
             )
 
 
-async def _do_trigger(temporal_host, flow_name, task_queue, params, workflow_timeout):
+async def _do_trigger(temporal_host, temporal_namespace, flow_name, task_queue, params, workflow_timeout):
     """Submit a MetaflowWorkflow to Temporal and return (run_id, workflow_id).
 
     The worker must already be running; this only submits the workflow for
@@ -185,7 +193,7 @@ async def _do_trigger(temporal_host, flow_name, task_queue, params, workflow_tim
     """
     from temporalio.client import Client
 
-    client = await Client.connect(temporal_host)
+    client = await Client.connect(temporal_host, namespace=temporal_namespace)
     workflow_id = "%s-%s" % (flow_name.lower(), uuid.uuid4().hex[:8])
     execution_timeout = timedelta(seconds=workflow_timeout) if workflow_timeout else None
     await client.start_workflow(
@@ -209,6 +217,12 @@ async def _do_trigger(temporal_host, flow_name, task_queue, params, workflow_tim
     default="localhost:7233",
     show_default=True,
     help="Temporal server host:port",
+)
+@click.option(
+    "--temporal-namespace",
+    default="default",
+    show_default=True,
+    help="Temporal server namespace",
 )
 @click.option(
     "--workflow-timeout",
@@ -245,6 +259,7 @@ def trigger(
     name,
     task_queue,
     temporal_host,
+    temporal_namespace,
     workflow_timeout,
     deployer_attribute_file,
     run_params,
@@ -256,7 +271,7 @@ def trigger(
     task_queue = _resolve_task_queue(obj, task_queue, branch=branch, production=production)
     params = _parse_run_params(run_params)
 
-    run_id, workflow_id = asyncio.run(_do_trigger(temporal_host, flow_name, task_queue, params, workflow_timeout))
+    run_id, workflow_id = asyncio.run(_do_trigger(temporal_host, temporal_namespace, flow_name, task_queue, params, workflow_timeout))
     pathspec = "%s/%s" % (flow_name, run_id)
 
     click.echo("Triggered Temporal workflow: %s (pathspec: %s)" % (workflow_id, pathspec))
@@ -274,7 +289,7 @@ def trigger(
             )
 
 
-async def _do_resume(temporal_host, flow_name, run_id, task_queue, params, workflow_timeout):
+async def _do_resume(temporal_host, temporal_namespace, flow_name, run_id, task_queue, params, workflow_timeout):
     """Resume a previously started Temporal workflow and wait for completion.
 
     Inspects the Metaflow datastore to find which steps already completed,
@@ -298,7 +313,7 @@ async def _do_resume(temporal_host, flow_name, run_id, task_queue, params, workf
         click.echo("Warning: could not read prior run state: %s" % e, err=True)
         resume_state = {}
 
-    client = await Client.connect(temporal_host)
+    client = await Client.connect(temporal_host, namespace=temporal_namespace)
     new_workflow_id = "%s-resume-%s" % (flow_name.lower(), uuid.uuid4().hex[:8])
     execution_timeout = timedelta(seconds=workflow_timeout) if workflow_timeout else None
 
@@ -334,6 +349,12 @@ async def _do_resume(temporal_host, flow_name, run_id, task_queue, params, workf
     help="Temporal server host:port",
 )
 @click.option(
+    "--temporal-namespace",
+    default="default",
+    show_default=True,
+    help="Temporal server namespace",
+)
+@click.option(
     "--workflow-timeout",
     default=None,
     type=int,
@@ -357,7 +378,7 @@ async def _do_resume(temporal_host, flow_name, run_id, task_queue, params, workf
     default=False,
     help="Target the @project production branch (must match the compiled worker).",
 )
-def resume(obj, run_id, name, task_queue, temporal_host, workflow_timeout, run_params, branch, production):
+def resume(obj, run_id, name, task_queue, temporal_host, temporal_namespace, workflow_timeout, run_params, branch, production):
     """Resume a previously failed or incomplete Temporal workflow run.
 
     RUN_ID is the Metaflow run ID of the run to resume (e.g. temporal-myflow-abc123).
@@ -367,4 +388,4 @@ def resume(obj, run_id, name, task_queue, temporal_host, workflow_timeout, run_p
     task_queue = _resolve_task_queue(obj, task_queue, branch=branch, production=production)
     params = _parse_run_params(run_params)
 
-    asyncio.run(_do_resume(temporal_host, flow_name, run_id, task_queue, params, workflow_timeout))
+    asyncio.run(_do_resume(temporal_host, temporal_namespace, flow_name, run_id, task_queue, params, workflow_timeout))

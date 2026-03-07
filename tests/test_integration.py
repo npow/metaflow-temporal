@@ -131,6 +131,41 @@ async def _run_flow(
     return run_id
 
 
+async def _get_config(client, task_queue: str, flow_file: Path, flow_name: str) -> dict:
+    """Compile a flow and return its CONFIG dict (without triggering a run)."""
+    import subprocess
+    import tempfile
+
+    out_file = tempfile.mktemp(suffix="_worker.py")
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(flow_file),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+                "--task-queue", task_queue,
+                "--temporal-host", "localhost:7233",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            "temporal create failed:\nSTDOUT: %s\nSTDERR: %s" % (result.stdout, result.stderr)
+        )
+        return _extract_config_from_worker(out_file)
+    finally:
+        try:
+            os.unlink(out_file)
+        except OSError:
+            pass
+
+
 class TestLinearFlow:
     @pytest.mark.asyncio
     async def test_linear_flow_completes(self, worker):
@@ -986,6 +1021,205 @@ class TestSagaExecution:
         )
         assert run_id.startswith("temporal-")
         assert not os.path.exists(_SAGA_LOG), "Compensation log written for successful flow"
+
+
+# ---------------------------------------------------------------------------
+# Resume tests
+# ---------------------------------------------------------------------------
+
+_FOREACH_SAGA_LOG = "/tmp/foreach_saga_test_log.json"
+
+
+class TestResumeFlow:
+    """Tests verifying that resume skips completed steps and re-runs the rest."""
+
+    @pytest.mark.asyncio
+    async def test_resume_skips_completed_start(self, worker):
+        """Run a flow to completion, then resume with start pre-seeded.
+
+        process and end should re-execute successfully using start's original
+        artifacts.  The result artifact must match the original run.
+        """
+        client, task_queue = worker
+
+        # First run: complete normally, record start's task_id
+        run_id = await _run_flow(
+            client, task_queue, FLOWS_DIR / "linear_flow.py", "LinearFlow", {}
+        )
+        assert run_id.startswith("temporal-")
+
+        # Discover start's task_id from the Metaflow datastore
+        mf_run = metaflow.Run("LinearFlow/%s" % run_id)
+        start_step = mf_run["start"]
+        start_task = list(start_step.tasks())[0]
+        start_task_id = start_task.id
+
+        # Build config for the resume run
+        config = await _get_config(client, task_queue, FLOWS_DIR / "linear_flow.py", "LinearFlow")
+
+        # Resume: seed start so it is skipped, re-run process + end
+        import uuid
+        resume_wf_id = "linearflow-resume-%s" % uuid.uuid4().hex[:8]
+        resume_run_id = await client.execute_workflow(
+            MetaflowWorkflow.run,
+            {
+                "config": config,
+                "params": {},
+                "resume_state": {"start": {"task_id": start_task_id}},
+                "run_id_override": run_id,
+            },
+            id=resume_wf_id,
+            task_queue=task_queue,
+        )
+
+        # Resume returns same run_id (run_id_override)
+        assert resume_run_id == run_id
+
+        # Artifacts from resumed run should be present and correct
+        mf_resume = metaflow.Run("LinearFlow/%s" % resume_run_id)
+        end_task = list(mf_resume["end"].tasks())[0]
+        assert end_task.data.result == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_resume_with_all_steps_seeded_is_noop(self, worker):
+        """Resuming with all steps already in resume_state is a no-op (completes instantly)."""
+        client, task_queue = worker
+
+        run_id = await _run_flow(
+            client, task_queue, FLOWS_DIR / "linear_flow.py", "LinearFlow", {}
+        )
+
+        mf_run = metaflow.Run("LinearFlow/%s" % run_id)
+        resume_state = {}
+        for step in mf_run:
+            tasks = list(step.tasks())
+            if tasks:
+                resume_state[step.id] = {"task_id": tasks[0].id}
+
+        config = await _get_config(client, task_queue, FLOWS_DIR / "linear_flow.py", "LinearFlow")
+
+        import uuid
+        resume_wf_id = "linearflow-noop-%s" % uuid.uuid4().hex[:8]
+        result = await client.execute_workflow(
+            MetaflowWorkflow.run,
+            {
+                "config": config,
+                "params": {},
+                "resume_state": resume_state,
+                "run_id_override": run_id,
+            },
+            id=resume_wf_id,
+            task_queue=task_queue,
+        )
+        assert result == run_id
+
+
+# ---------------------------------------------------------------------------
+# Foreach saga compensation tests
+# ---------------------------------------------------------------------------
+
+
+class TestForeachSagaExecution:
+    """Tests verifying saga compensations trigger correctly in foreach flows."""
+
+    @pytest.mark.asyncio
+    async def test_foreach_compensation_runs_for_all_slices(self, worker):
+        """When fail_step fails after a foreach body, each completed body slice
+        should have its compensation handler invoked."""
+        import json
+        import os
+
+        if os.path.exists(_FOREACH_SAGA_LOG):
+            os.unlink(_FOREACH_SAGA_LOG)
+
+        client, task_queue = worker
+
+        with pytest.raises(Exception):
+            await _run_flow(
+                client,
+                task_queue,
+                FLOWS_DIR / "foreach_saga_flow.py",
+                "ForeachSagaFlow",
+                {},
+            )
+
+        assert os.path.exists(_FOREACH_SAGA_LOG), (
+            "Foreach saga log not created — compensations did not run"
+        )
+        with open(_FOREACH_SAGA_LOG) as f:
+            log = json.load(f)
+
+        actions = [e["action"] for e in log]
+        items = [e["item"] for e in log]
+
+        # Both body slices should have been compensated
+        assert actions.count("cancel_body") == 2, (
+            "Expected 2 cancel_body compensations, got: %s" % actions
+        )
+        # Both items should appear in the log
+        assert set(items) == {"item-a", "item-b"}, (
+            "Expected items item-a and item-b, got: %s" % items
+        )
+
+
+# ---------------------------------------------------------------------------
+# Temporal namespace compilation test
+# ---------------------------------------------------------------------------
+
+
+class TestTemporalNamespace:
+    """Verify temporal_namespace is baked into the compiled worker config."""
+
+    def test_default_namespace_in_config(self, tmp_path):
+        import subprocess
+
+        out_file = str(tmp_path / "worker.py")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(FLOWS_DIR / "linear_flow.py"),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+                "--task-queue", "test",
+                "--temporal-host", "localhost:7233",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        config = _extract_config_from_worker(out_file)
+        assert config.get("temporal_namespace") == "default"
+
+    def test_custom_namespace_in_config(self, tmp_path):
+        import subprocess
+
+        out_file = str(tmp_path / "worker.py")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(FLOWS_DIR / "linear_flow.py"),
+                "--no-pylint",
+                "--metadata=local",
+                "--datastore=local",
+                "--environment=local",
+                "temporal",
+                "create",
+                "--output", out_file,
+                "--task-queue", "test",
+                "--temporal-host", "localhost:7233",
+                "--temporal-namespace", "my-namespace",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        config = _extract_config_from_worker(out_file)
+        assert config.get("temporal_namespace") == "my-namespace"
 
 
 # ---------------------------------------------------------------------------

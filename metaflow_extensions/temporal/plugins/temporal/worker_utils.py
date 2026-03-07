@@ -1191,7 +1191,10 @@ class WorkerUtils:
     @staticmethod
     async def run_worker(config: dict):
         """Start the Temporal worker for this flow."""
-        client = await Client.connect(config["temporal_host"])
+        client = await Client.connect(
+            config["temporal_host"],
+            namespace=config.get("temporal_namespace", "default"),
+        )
 
         shutdown_event = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -1336,7 +1339,10 @@ class WorkerUtils:
     @staticmethod
     async def trigger(config: dict, params: dict) -> str:
         """Trigger a workflow run and wait for completion."""
-        client = await Client.connect(config["temporal_host"])
+        client = await Client.connect(
+            config["temporal_host"],
+            namespace=config.get("temporal_namespace", "default"),
+        )
         workflow_id = "%s-%s" % (config["flow_name"].lower(), uuid.uuid4().hex[:8])
         timeout_seconds = config.get("workflow_timeout_seconds")
         execution_timeout = timedelta(seconds=timeout_seconds) if timeout_seconds else None

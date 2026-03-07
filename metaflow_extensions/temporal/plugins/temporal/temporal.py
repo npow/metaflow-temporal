@@ -51,6 +51,7 @@ class Temporal:
         max_workers=10,
         task_queue=None,
         temporal_host="localhost:7233",
+        temporal_namespace="default",
         branch=None,
         production=False,
         workflow_timeout_seconds=None,
@@ -69,6 +70,7 @@ class Temporal:
         self.username = username
         self.max_workers = max_workers
         self.temporal_host = temporal_host
+        self.temporal_namespace = temporal_namespace
         self.branch = branch
         self.production = production
         self.workflow_timeout_seconds = workflow_timeout_seconds
@@ -125,6 +127,7 @@ class Temporal:
             "flow_file": self.flow_file,
             "task_queue": self.task_queue,
             "temporal_host": self.temporal_host,
+            "temporal_namespace": self.temporal_namespace,
             "max_workers": self.max_workers,
             # Runtime provider types — forwarded as CLI flags to each step subprocess.
             "metadata_type": self.metadata.TYPE,
