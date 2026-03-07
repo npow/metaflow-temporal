@@ -11,6 +11,13 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 from metaflow.runner.deployer import DeployedFlow, TriggeredRun
 from metaflow.runner.utils import get_lower_level_group, handle_timeout, temporary_fifo
 
+# Default port for the Temporal UI web server.
+_TEMPORAL_UI_PORT = 8080
+
+# Seconds to wait after spawning the worker subprocess before submitting workflows.
+# The worker needs time to connect to the Temporal server and register its task queue.
+_WORKER_STARTUP_WAIT_SECONDS = 3
+
 if TYPE_CHECKING:
     import metaflow
     import metaflow.runner.deployer_impl
@@ -72,7 +79,7 @@ class TemporalTriggeredRun(TriggeredRun):
                 )
                 # Derive UI base URL from temporal_host (strip port, use default UI port 8080)
                 host = temporal_host.split(":")[0]
-                return "http://%s:8080/namespaces/default/workflows/%s" % (host, workflow_id)
+                return "http://%s:%d/namespaces/default/workflows/%s" % (host, _TEMPORAL_UI_PORT, workflow_id)
         except Exception:
             pass
         return None
@@ -135,8 +142,8 @@ class TemporalDeployedFlow(DeployedFlow):
             stderr=subprocess.DEVNULL,
         )
         self.deployer._worker_process = proc
-        # Give the worker a moment to connect to the Temporal server.
-        time.sleep(3)
+        # Give the worker time to connect to Temporal and register its task queue.
+        time.sleep(_WORKER_STARTUP_WAIT_SECONDS)
 
     def run(self, **kwargs) -> TemporalTriggeredRun:
         """Trigger a new run of this deployed flow.

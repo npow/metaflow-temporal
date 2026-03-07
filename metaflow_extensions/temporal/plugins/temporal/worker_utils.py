@@ -40,6 +40,11 @@ _DEFAULT_STEP_TIMEOUT_SECONDS = 3600  # 1 hour
 # Default delay between retries when no @retry(minutes_between_retries=N) is set.
 _DEFAULT_RETRY_DELAY_SECONDS = 120  # 2 minutes
 
+# Saga compensation activity: max wall-clock time and retry settings.
+_COMPENSATION_TIMEOUT_SECONDS = 300   # 5 minutes per compensation handler
+_COMPENSATION_RETRY_ATTEMPTS = 3
+_COMPENSATION_RETRY_DELAY_SECONDS = 5
+
 
 # ---------------------------------------------------------------------------
 # Data types shared between workflow and activities
@@ -323,6 +328,11 @@ def _build_dump_cmd(inp: StepInput, params_task_id: str) -> list:
 _artifact_lock = threading.Lock()
 
 
+def _build_task_pathspec(flow_name: str, run_id: str, step_name: str, task_id: str) -> str:
+    """Return the Metaflow task pathspec ``flow/run/step/task``."""
+    return "%s/%s/%s/%s" % (flow_name, run_id, step_name, task_id)
+
+
 @contextlib.contextmanager
 def _metaflow_datastore_env(datastore_root: str):
     """Temporarily override METAFLOW_DATASTORE_SYSROOT_LOCAL under _artifact_lock.
@@ -359,12 +369,7 @@ def _read_artifact_names(inp: StepInput) -> list:
         import metaflow
 
         datastore_root = _datastore_root_arg(inp.env_overrides)
-        pathspec = "%s/%s/%s/%s" % (
-            inp.flow_name,
-            inp.run_id,
-            inp.step_name,
-            inp.task_id,
-        )
+        pathspec = _build_task_pathspec(inp.flow_name, inp.run_id, inp.step_name, inp.task_id)
         with _metaflow_datastore_env(datastore_root):
             metaflow.metadata(inp.metadata_type)
             task = metaflow.Task(pathspec)
@@ -389,12 +394,7 @@ def _read_transition(inp: StepInput) -> Optional[str]:
         import metaflow
 
         datastore_root = _datastore_root_arg(inp.env_overrides)
-        pathspec = "%s/%s/%s/%s" % (
-            inp.flow_name,
-            inp.run_id,
-            inp.step_name,
-            inp.task_id,
-        )
+        pathspec = _build_task_pathspec(inp.flow_name, inp.run_id, inp.step_name, inp.task_id)
         with _metaflow_datastore_env(datastore_root):
             metaflow.metadata(inp.metadata_type)
             task = metaflow.Task(pathspec)
@@ -528,8 +528,8 @@ async def run_metaflow_step(inp: StepInput) -> StepOutput:
             foreach_cardinality=out.get("foreach_cardinality", 0),
             artifact_names=artifact_names,
             artifact_fetch_hint=(
-                "import metaflow; t = metaflow.Task('%s/%s/%s/%s'); t.data.<name>"
-                % (inp.flow_name, inp.run_id, inp.step_name, inp.task_id)
+                "import metaflow; t = metaflow.Task('%s'); t.data.<name>"
+                % _build_task_pathspec(inp.flow_name, inp.run_id, inp.step_name, inp.task_id)
             ) if artifact_names else None,
             chosen_branch=chosen_branch,
         )
@@ -556,12 +556,7 @@ async def run_compensation(inp: CompensationInput) -> None:
     with _metaflow_datastore_env(root):
         import metaflow
         metaflow.metadata(inp.metadata_type)
-        pathspec = "%s/%s/%s/%s" % (
-            inp.flow_name,
-            inp.run_id,
-            inp.forward_step,
-            inp.task_id,
-        )
+        pathspec = _build_task_pathspec(inp.flow_name, inp.run_id, inp.forward_step, inp.task_id)
         task = metaflow.Task(pathspec)
         for a in task.artifacts:
             if not a.id.startswith("_"):
@@ -689,10 +684,7 @@ class MetaflowWorkflow:
         resume_state: Optional[dict] = None,
         run_id_override: Optional[str] = None,
     ) -> str:
-        if run_id_override:
-            run_id = run_id_override
-        else:
-            run_id = "temporal-%s" % workflow.info().workflow_id[:20]
+        run_id = run_id_override or "temporal-%s" % workflow.info().workflow_id[:20]
         # Seed task_ids from resume_state so that already-completed steps are
         # skipped and their task_ids are available for input_paths resolution.
         task_ids: dict = {}
@@ -735,10 +727,10 @@ class MetaflowWorkflow:
                         datastore_type=cfg.get("datastore_type", "local"),
                         datastore_root=cfg.get("datastore_root", ""),
                     ),
-                    start_to_close_timeout=timedelta(seconds=300),
+                    start_to_close_timeout=timedelta(seconds=_COMPENSATION_TIMEOUT_SECONDS),
                     retry_policy=RetryPolicy(
-                        maximum_attempts=3,
-                        initial_interval=timedelta(seconds=5),
+                        maximum_attempts=_COMPENSATION_RETRY_ATTEMPTS,
+                        initial_interval=timedelta(seconds=_COMPENSATION_RETRY_DELAY_SECONDS),
                     ),
                 )
             except Exception:
@@ -753,7 +745,7 @@ class MetaflowWorkflow:
         params: dict,
         split_index: int,
         resume_state: Optional[dict] = None,
-    ):
+    ) -> None:
         steps = cfg["steps"]
         node = steps[step_name]
         node_type = node["type"]
@@ -782,7 +774,10 @@ class MetaflowWorkflow:
         else:
             task_id = "temporal-%s-%d" % (step_name, retry_count)
 
-        inp = _make_step_input(cfg, node, step_name, run_id, task_id, input_paths, retry_count, split_index, params)
+        inp = _make_step_input(
+            cfg, node, step_name, run_id, task_id, input_paths,
+            retry_count, split_index, params,
+        )
         retry_policy = _make_retry_policy(node)
         timeout_seconds = node.get("timeout_seconds", _DEFAULT_STEP_TIMEOUT_SECONDS)
 
@@ -812,7 +807,7 @@ class MetaflowWorkflow:
             body_task_ids_list = await asyncio.gather(
                 *[
                     self._execute_foreach_slice(
-                        body_step, cfg, run_id, params, i, retry_count, dict(task_ids)
+                        body_step, cfg, run_id, i, retry_count, dict(task_ids)
                     )
                     for i in range(cardinality)
                 ]
@@ -882,7 +877,6 @@ class MetaflowWorkflow:
         step_name: str,
         cfg: dict,
         run_id: str,
-        params: dict,
         split_index: int,
         retry_count: int,
         task_ids: dict,
@@ -937,13 +931,8 @@ class MetaflowWorkflow:
             inner_task_ids_list = await asyncio.gather(
                 *[
                     self._execute_foreach_slice(
-                        inner_body_step,
-                        cfg,
-                        run_id,
-                        params,
-                        inner_split_index,
-                        retry_count,
-                        dict(task_ids),
+                        inner_body_step, cfg, run_id,
+                        inner_split_index, retry_count, dict(task_ids),
                     )
                     for inner_split_index in range(inner_cardinality)
                 ]
@@ -962,7 +951,7 @@ class MetaflowWorkflow:
             # Execute the inner join step
             inner_body_node = steps[inner_body_step]
             inner_join_step = inner_body_node["out_funcs"][0]
-            await self._execute_node(inner_join_step, cfg, run_id, task_ids, params, -1)
+            await self._execute_node(inner_join_step, cfg, run_id, task_ids, {}, -1)
 
         return task_ids
 
@@ -973,7 +962,7 @@ class MetaflowWorkflow:
         run_id: str,
         retry_count: int,
         task_ids: dict,
-    ) -> "StepOutput":
+    ) -> StepOutput:
         """Run a single branch step as a Temporal activity and record its task_id.
 
         Shared by both branch traversal methods to avoid duplicating the
@@ -1024,12 +1013,7 @@ class MetaflowWorkflow:
             await self._dispatch_activity(current, cfg, run_id, retry_count, task_ids)
 
             out_funcs = node["out_funcs"]
-            if not out_funcs:
-                break
-            next_step = out_funcs[0]
-            if steps[next_step]["type"] == "join":
-                break
-            current = next_step
+            current = out_funcs[0] if out_funcs else None
 
         return task_ids
 
@@ -1107,22 +1091,16 @@ def _resolve_input_paths(
     if not in_funcs:
         return ""
 
-    split_parents = node.get("split_parents", [])
-    is_foreach_join = False
-    if node["type"] == "join" and split_parents:
-        # Check if the innermost split parent is a foreach
-        # We don't have cfg here, so we check if body_step task_ids is a list
+    # Foreach join: the body step's task_ids is a list of per-slice task_ids.
+    # Detect this by checking whether the first parent's recorded task_ids is a list
+    # (set by _execute_node after gathering all slices).
+    if node["type"] == "join" and node.get("split_parents"):
         body_step = in_funcs[0]
-        parent_ids = task_ids.get(body_step)
-        if isinstance(parent_ids, list):
-            is_foreach_join = True
-
-    if is_foreach_join:
-        body_step = in_funcs[0]
-        split_ids = task_ids.get(body_step, [])
-        return ",".join(
-            "%s/%s/%s" % (run_id, body_step, tid) for tid in split_ids
-        )
+        split_ids = task_ids.get(body_step)
+        if isinstance(split_ids, list):
+            return ",".join(
+                "%s/%s/%s" % (run_id, body_step, tid) for tid in split_ids
+            )
 
     if len(in_funcs) == 1:
         parent = in_funcs[0]
