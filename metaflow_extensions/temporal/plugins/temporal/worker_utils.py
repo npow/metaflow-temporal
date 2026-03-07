@@ -152,7 +152,7 @@ def _top_level_args(inp: StepInput) -> list:
     return args
 
 
-class _RuntimeCLIArgs(object):
+class _RuntimeCLIArgs:
     """Minimal CLIArgs shim for StepDecorator.runtime_step_cli hooks."""
 
     def __init__(self, inp: StepInput, input_paths: str):
@@ -589,11 +589,10 @@ async def run_compensation(inp: CompensationInput) -> None:
     for k, v in artifacts.items():
         instance.__dict__[k] = v
     handler = getattr(instance, inp.handler_name)
-    loop = asyncio.get_running_loop()
     if asyncio.iscoroutinefunction(handler):
         await handler()
     else:
-        await loop.run_in_executor(None, handler)
+        await asyncio.get_running_loop().run_in_executor(None, handler)
 
 
 # ---------------------------------------------------------------------------
@@ -733,8 +732,11 @@ class MetaflowWorkflow:
                         initial_interval=timedelta(seconds=_COMPENSATION_RETRY_DELAY_SECONDS),
                     ),
                 )
-            except Exception:
-                pass  # best-effort: log and continue
+            except Exception as exc:
+                print(
+                    "Warning: compensation for step %r failed: %s" % (entry["step"], exc),
+                    file=sys.stderr,
+                )
 
     async def _execute_node(
         self,
@@ -767,8 +769,7 @@ class MetaflowWorkflow:
 
         input_paths = _resolve_input_paths(step_name, node, run_id, task_ids, steps=steps)
 
-        temporal_attempt = workflow.info().attempt
-        retry_count = max(0, temporal_attempt - 1)
+        retry_count = max(0, workflow.info().attempt - 1)
         if split_index >= 0:
             task_id = "temporal-%s-%d-%d" % (step_name, split_index, retry_count)
         else:
@@ -1050,9 +1051,7 @@ class MetaflowWorkflow:
             await self._dispatch_activity(current, cfg, run_id, retry_count, task_ids)
 
             out_funcs = node["out_funcs"]
-            if not out_funcs or out_funcs[0] == merge_step:
-                break
-            current = out_funcs[0]
+            current = out_funcs[0] if out_funcs and out_funcs[0] != merge_step else None
 
         return task_ids
 
