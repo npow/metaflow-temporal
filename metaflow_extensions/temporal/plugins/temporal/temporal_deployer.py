@@ -6,7 +6,7 @@ is available and the UX test suite can parametrise ``--scheduler-type=temporal``
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, Dict, Optional, Type
+from typing import TYPE_CHECKING, ClassVar
 
 from metaflow.runner.deployer_impl import DeployerImpl
 
@@ -29,23 +29,23 @@ class TemporalDeployer(DeployerImpl):
         Maximum concurrent activity workers (default 10).
     """
 
-    TYPE: ClassVar[Optional[str]] = "temporal"
+    TYPE: ClassVar[str | None] = "temporal"
 
-    def __init__(self, deployer_kwargs: Dict[str, str], **kwargs) -> None:
+    def __init__(self, deployer_kwargs: dict[str, str], **kwargs) -> None:
         self._deployer_kwargs = deployer_kwargs
         super().__init__(**kwargs)
 
     @property
-    def deployer_kwargs(self) -> Dict[str, str]:
+    def deployer_kwargs(self) -> dict[str, str]:
         return self._deployer_kwargs
 
     @staticmethod
-    def deployed_flow_type() -> Type["TemporalDeployedFlow"]:
+    def deployed_flow_type() -> type[TemporalDeployedFlow]:
         from .temporal_deployer_objects import TemporalDeployedFlow
 
         return TemporalDeployedFlow
 
-    def create(self, **kwargs) -> "TemporalDeployedFlow":
+    def create(self, **kwargs) -> TemporalDeployedFlow:
         """Compile and register this flow as a Temporal worker.
 
         Parameters

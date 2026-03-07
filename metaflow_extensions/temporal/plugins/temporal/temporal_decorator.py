@@ -29,7 +29,7 @@ class TemporalInternalDecorator(StepDecorator):
                     field="temporal-workflow-id",
                     value=os.environ["METAFLOW_TEMPORAL_WORKFLOW_ID"],
                     type="temporal-workflow-id",
-                    tags=["attempt_id:{0}".format(retry_count)],
+                    tags=[f"attempt_id:{retry_count}"],
                 )
             )
         if "METAFLOW_TEMPORAL_RUN_ID" in os.environ:
@@ -38,7 +38,7 @@ class TemporalInternalDecorator(StepDecorator):
                     field="temporal-run-id",
                     value=os.environ["METAFLOW_TEMPORAL_RUN_ID"],
                     type="temporal-run-id",
-                    tags=["attempt_id:{0}".format(retry_count)],
+                    tags=[f"attempt_id:{retry_count}"],
                 )
             )
         if entries:

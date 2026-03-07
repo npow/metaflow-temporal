@@ -1,12 +1,9 @@
 import inspect
 import json
 import os
-import sys
 import warnings
 from datetime import datetime
-from typing import Optional
 
-from metaflow.exception import MetaflowException
 from metaflow.decorators import StepDecorator
 
 try:
@@ -159,7 +156,7 @@ class Temporal:
             "code_package": self._get_code_package_info(),
         }
 
-    def _get_code_package_info(self) -> Optional[dict]:
+    def _get_code_package_info(self) -> dict | None:
         if self._code_package_info is not None:
             return self._code_package_info
         try:
@@ -377,7 +374,7 @@ class Temporal:
                 return int(minutes * 60)
         return _DEFAULT_RETRY_DELAY_SECONDS
 
-    def _get_schedule(self) -> Optional[dict]:
+    def _get_schedule(self) -> dict | None:
         """Extract @schedule decorator config from flow-level decorators."""
         try:
             flow_decos = getattr(self.flow, "_flow_decorators", {})
@@ -400,7 +397,7 @@ class Temporal:
             pass
         return None
 
-    def _get_project(self) -> Optional[dict]:
+    def _get_project(self) -> dict | None:
         """Extract @project decorator config and compute the project-aware flow name."""
         try:
             from metaflow.plugins.project_decorator import format_name

@@ -6,7 +6,7 @@ import os
 import sys
 import time
 import subprocess
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, ClassVar
 
 from metaflow.runner.deployer import DeployedFlow, TriggeredRun
 from metaflow.runner.utils import get_lower_level_group, handle_timeout, temporary_fifo
@@ -19,8 +19,7 @@ _TEMPORAL_UI_PORT = 8080
 _WORKER_STARTUP_WAIT_SECONDS = 3
 
 if TYPE_CHECKING:
-    import metaflow
-    import metaflow.runner.deployer_impl
+    pass
 
 
 class TemporalTriggeredRun(TriggeredRun):
@@ -68,7 +67,7 @@ class TemporalTriggeredRun(TriggeredRun):
                 os.environ["METAFLOW_DATASTORE_SYSROOT_LOCAL"] = old_sysroot
 
     @property
-    def temporal_ui(self) -> Optional[str]:
+    def temporal_ui(self) -> str | None:
         """URL to the Temporal UI for this workflow run, if available."""
         try:
             _, run_id = self.pathspec.split("/")
@@ -85,7 +84,7 @@ class TemporalTriggeredRun(TriggeredRun):
         return None
 
     @property
-    def status(self) -> Optional[str]:
+    def status(self) -> str | None:
         """Return a simple status string based on the underlying Metaflow run."""
         run = self.run
         if run is None:
@@ -100,7 +99,7 @@ class TemporalTriggeredRun(TriggeredRun):
 class TemporalDeployedFlow(DeployedFlow):
     """A Metaflow flow compiled as a Temporal worker and ready to trigger."""
 
-    TYPE: ClassVar[Optional[str]] = "temporal"
+    TYPE: ClassVar[str | None] = "temporal"
 
     @property
     def id(self) -> str:
@@ -201,7 +200,7 @@ class TemporalDeployedFlow(DeployedFlow):
     trigger = run
 
     @classmethod
-    def from_deployment(cls, identifier: str, metadata: Optional[str] = None) -> "TemporalDeployedFlow":
+    def from_deployment(cls, identifier: str, metadata: str | None = None) -> TemporalDeployedFlow:
         """Recover a TemporalDeployedFlow from a deployment identifier."""
         import json
         from .temporal_deployer import TemporalDeployer

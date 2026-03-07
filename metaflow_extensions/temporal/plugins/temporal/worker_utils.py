@@ -670,7 +670,7 @@ class MetaflowWorkflow:
     async def run(self, args: dict) -> str:
         cfg = args.get("config")
         if cfg is None or args.get("_use_embedded_config"):
-            cfg = CONFIG
+            cfg = CONFIG  # noqa: F821 — defined in generated worker at runtime
         params = args.get("params", {})
         resume_state = args.get("resume_state")  # {step_name: {"task_id": str}, ...}
         run_id_override = args.get("run_id_override")
