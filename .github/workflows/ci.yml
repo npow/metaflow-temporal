@@ -27,5 +27,12 @@ jobs:
       - name: Lint
         run: ruff check metaflow_extensions/
 
-      - name: Run tests
-        run: pytest -v --timeout=180 -m "not integration"
+      - name: Run tests with coverage
+        run: pytest -v --timeout=180 -m "not integration" --cov=metaflow_extensions --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.12'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
