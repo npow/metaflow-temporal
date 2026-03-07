@@ -7,7 +7,6 @@ import asyncio
 import json
 import os
 import signal
-import subprocess
 import sys
 import tempfile
 import threading
@@ -804,17 +803,12 @@ class MetaflowWorkflow:
                 ]
             )
 
-            # Collect the body-step task_ids from each slice for the join's
-            # input_paths.  body_task_ids_list[i] is the task_ids dict for
-            # slice i; the body_step key holds that slice's task_id string.
-            split_task_ids = [
-                slice_ids[body_step]
-                for slice_ids in body_task_ids_list
-                if not isinstance(slice_ids.get(body_step), list)
-            ]
-            # Flatten list entries (shouldn't occur at this level, but be safe)
+            # Flatten each slice's body_step task_id into a single list so the
+            # join step receives all parallel input paths.  body_task_ids_list[i]
+            # is the accumulated task_ids dict for slice i.
             flat_split_task_ids = []
-            for tid in [slice_ids.get(body_step) for slice_ids in body_task_ids_list]:
+            for slice_ids in body_task_ids_list:
+                tid = slice_ids.get(body_step)
                 if isinstance(tid, list):
                     flat_split_task_ids.extend(tid)
                 else:
@@ -958,6 +952,37 @@ class MetaflowWorkflow:
 
         return task_ids
 
+    async def _dispatch_activity(
+        self,
+        step_name: str,
+        cfg: dict,
+        run_id: str,
+        retry_count: int,
+        task_ids: dict,
+    ) -> StepOutput:
+        """Run a single branch step as a Temporal activity and record its task_id.
+
+        Shared by both branch traversal methods to avoid duplicating the
+        activity dispatch boilerplate.
+        """
+        steps = cfg["steps"]
+        node = steps[step_name]
+        input_paths = _resolve_input_paths(step_name, node, run_id, task_ids, steps=steps)
+        task_id = "temporal-%s-%d" % (step_name, retry_count)
+        inp = _make_step_input(cfg, node, step_name, run_id, task_id, input_paths, retry_count, -1, {})
+        timeout_seconds = node.get("timeout_seconds", 3600)
+
+        out: StepOutput = await workflow.execute_activity(
+            run_metaflow_step,
+            inp,
+            start_to_close_timeout=timedelta(seconds=timeout_seconds),
+            heartbeat_timeout=timedelta(seconds=60),
+            retry_policy=_make_retry_policy(node),
+        )
+        task_ids[step_name] = out.task_id
+        self._push_compensation(cfg, step_name, out.task_id)
+        return out
+
     async def _execute_branch_until_join(
         self,
         step_name: str,
@@ -968,8 +993,10 @@ class MetaflowWorkflow:
         task_ids: dict = None,
     ) -> dict:
         """Execute a branch from step_name until it reaches a join node.
-        Returns a dict of step_name -> task_id for steps executed in this branch.
-        task_ids is the caller's snapshot (contains the split node's task_id).
+
+        The join node itself is NOT executed — the caller handles that after
+        all parallel branches have finished.  Returns the accumulated
+        task_ids dict (caller's snapshot plus steps executed here).
         """
         steps = cfg["steps"]
         if task_ids is None:
@@ -978,27 +1005,10 @@ class MetaflowWorkflow:
 
         while current is not None:
             node = steps[current]
-            node_type = node["type"]
+            if node["type"] == "join":
+                break  # let the caller handle the join
 
-            # Stop at join — let the caller handle it
-            if node_type == "join":
-                break
-
-            input_paths = _resolve_input_paths(current, node, run_id, task_ids, steps=steps)
-            task_id = "temporal-%s-%d" % (current, retry_count)
-            inp = _make_step_input(cfg, node, current, run_id, task_id, input_paths, retry_count, -1, {})
-            retry_policy = _make_retry_policy(node)
-            timeout_seconds = node.get("timeout_seconds", 3600)
-
-            out: StepOutput = await workflow.execute_activity(
-                run_metaflow_step,
-                inp,
-                start_to_close_timeout=timedelta(seconds=timeout_seconds),
-                heartbeat_timeout=timedelta(seconds=60),
-                retry_policy=retry_policy,
-            )
-            task_ids[current] = out.task_id
-            self._push_compensation(cfg, current, out.task_id)
+            await self._dispatch_activity(current, cfg, run_id, retry_count, task_ids)
 
             out_funcs = node["out_funcs"]
             if not out_funcs:
@@ -1022,10 +1032,10 @@ class MetaflowWorkflow:
     ) -> dict:
         """Execute one branch of a split-switch until it reaches the merge step.
 
-        Unlike ``_execute_branch_until_join``, the stopping condition is the
-        named ``merge_step`` (a regular linear step, not a ``join`` type) rather
-        than any node of type ``join``.  The merge step itself is NOT executed
-        here — the caller handles that after all (one) branch has finished.
+        Unlike ``_execute_branch_until_join``, the stop condition is the named
+        ``merge_step`` (a regular linear step, not a ``join`` type).  The merge
+        step itself is NOT executed here — the caller handles it after the
+        single chosen branch finishes.
 
         Returns the accumulated ``task_ids`` dict for this branch.
         """
@@ -1033,41 +1043,20 @@ class MetaflowWorkflow:
         current = step_name
 
         while current is not None:
-            # Stop when we reach the merge step — caller will execute it
             if current == merge_step:
-                break
+                break  # let the caller execute the merge step
 
             node = steps[current]
-            node_type = node["type"]
-
-            # Also stop at any join type node (shouldn't happen in a split-switch
-            # branch, but be defensive)
-            if node_type == "join":
+            # Defensive: stop at any join node (shouldn't occur in a split-switch branch)
+            if node["type"] == "join":
                 break
 
-            input_paths = _resolve_input_paths(current, node, run_id, task_ids, steps=steps)
-            task_id = "temporal-%s-%d" % (current, retry_count)
-            inp = _make_step_input(cfg, node, current, run_id, task_id, input_paths, retry_count, -1, {})
-            retry_policy = _make_retry_policy(node)
-            timeout_seconds = node.get("timeout_seconds", 3600)
-
-            out: StepOutput = await workflow.execute_activity(
-                run_metaflow_step,
-                inp,
-                start_to_close_timeout=timedelta(seconds=timeout_seconds),
-                heartbeat_timeout=timedelta(seconds=60),
-                retry_policy=retry_policy,
-            )
-            task_ids[current] = out.task_id
-            self._push_compensation(cfg, current, out.task_id)
+            await self._dispatch_activity(current, cfg, run_id, retry_count, task_ids)
 
             out_funcs = node["out_funcs"]
-            if not out_funcs:
+            if not out_funcs or out_funcs[0] == merge_step:
                 break
-            next_step = out_funcs[0]
-            if next_step == merge_step:
-                break
-            current = next_step
+            current = out_funcs[0]
 
         return task_ids
 
@@ -1210,7 +1199,7 @@ class WorkerUtils:
         client = await Client.connect(config["temporal_host"])
 
         shutdown_event = asyncio.Event()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
                 loop.add_signal_handler(sig, shutdown_event.set)
