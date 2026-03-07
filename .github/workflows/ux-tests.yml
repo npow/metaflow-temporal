@@ -1,0 +1,75 @@
+name: UX Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * *"  # nightly — catches upstream metaflow regressions
+  workflow_dispatch:
+
+jobs:
+  ux-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      METAFLOW_DEFAULT_METADATA: local
+      METAFLOW_DEFAULT_DATASTORE: local
+      METAFLOW_DEFAULT_ENVIRONMENT: local
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Pin Metaflow local datastore root
+        run: echo "METAFLOW_DATASTORE_SYSROOT_LOCAL=$HOME" >> "$GITHUB_ENV"
+
+      - name: Start Temporal
+        run: docker compose up -d postgresql temporal
+
+      - name: Wait for Temporal to be ready
+        run: |
+          pip install temporalio
+          python - <<'EOF'
+          import asyncio, sys
+          async def wait():
+              from temporalio.client import Client
+              for i in range(60):
+                  try:
+                      await asyncio.wait_for(Client.connect("localhost:7233"), timeout=3.0)
+                      print("Temporal is ready!")
+                      return
+                  except Exception as e:
+                      print(f"Waiting for Temporal ({i+1}/60): {e}")
+                      await asyncio.sleep(2)
+              print("ERROR: Temporal did not become ready in time", file=sys.stderr)
+              sys.exit(1)
+          asyncio.run(wait())
+          EOF
+
+      - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
+        with:
+          extra-install: "."
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          ux-test-config: |
+            backends:
+              - name: temporal
+                scheduler_type: temporal
+                cluster: null
+                decospec: null
+                deploy_args:
+                  temporal_host: "localhost:7233"
+                enabled: true
+
+      - name: Show Temporal logs on failure
+        if: failure()
+        run: docker compose logs temporal
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
