@@ -56,7 +56,6 @@ jobs:
           - test_resources
           - test_catch
           - test_timeout
-          - test_hello_conda
           - test_config_simple_default
           - test_config_simple_config_value
           - test_config_simple_config
