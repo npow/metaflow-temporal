@@ -84,7 +84,7 @@ class Temporal:
         self._project_info = self._get_project()
         # Sanitize dots to hyphens for the task queue name.
         self.task_queue = task_queue or (
-            "metaflow-%s" % self._effective_flow_name.lower().replace(".", "-")
+            "metaflow-{}".format(self._effective_flow_name.lower().replace(".", "-"))
         )
         self._code_package_info = None
 
@@ -116,8 +116,8 @@ class Temporal:
         tags = list(self.tags)
         if self._project_info:
             tags = tags + [
-                "project:%s" % self._project_info["name"],
-                "project_branch:%s" % self._project_info["branch"],
+                "project:{}".format(self._project_info["name"]),
+                "project_branch:{}".format(self._project_info["branch"]),
             ]
         return {
             "flow_name": flow_name,
@@ -145,6 +145,8 @@ class Temporal:
             "workflow_timeout_seconds": self.workflow_timeout_seconds,
             # Metaflow namespace (forwarded to step subprocesses via --namespace)
             "namespace": self.namespace or "",
+            # @project branch name (forwarded to step subprocesses via --branch)
+            "branch": self.branch or "",
             # Saga compensation map: {"step_name": "handler_method_name", ...}
             "compensations": self._build_compensations(),
             # Original Python class name (needed by run_compensation to importlib-load the class)
@@ -198,9 +200,9 @@ class Temporal:
                     pass
                 elif callable(default):
                     warnings.warn(
-                        "Parameter '%s' has a callable default. Its value cannot be "
+                        f"Parameter '{var}' has a callable default. Its value cannot be "
                         "baked into the worker file — you must supply it explicitly "
-                        "at trigger time (e.g. trigger %s=<value>)." % (var, var),
+                        f"at trigger time (e.g. trigger {var}=<value>).",
                         UserWarning,
                         stacklevel=2,
                     )
@@ -269,13 +271,13 @@ class Temporal:
                     memory = attrs.get("memory")
                     gpu = attrs.get("gpu")
                     if cpu is not None:
-                        resource_parts.append("cpu=%s" % cpu)
+                        resource_parts.append(f"cpu={cpu}")
                     if memory is not None:
-                        resource_parts.append("memory=%s" % memory)
+                        resource_parts.append(f"memory={memory}")
                     if gpu is not None:
-                        resource_parts.append("gpu=%s" % gpu)
+                        resource_parts.append(f"gpu={gpu}")
                     if resource_parts:
-                        spec = "resources:%s" % ",".join(resource_parts)
+                        spec = "resources:{}".format(",".join(resource_parts))
                         if spec not in seen:
                             seen.add(spec)
                             specs.append(spec)
@@ -326,9 +328,9 @@ class Temporal:
                     json.dumps(v)
                 except Exception:
                     warnings.warn(
-                        "Decorator '%s' field '%s' is not JSON-serializable and "
+                        f"Decorator '{name}' field '{k}' is not JSON-serializable and "
                         "will not be forwarded to the worker. Runtime behavior "
-                        "may differ if this field is required by runtime_step_cli." % (name, k),
+                        "may differ if this field is required by runtime_step_cli.",
                         UserWarning,
                         stacklevel=2,
                     )
@@ -365,7 +367,7 @@ class Temporal:
         # Datastore root
         datastore_root = getattr(self.flow_datastore, "datastore_root", None)
         if datastore_root:
-            env["METAFLOW_DATASTORE_SYSROOT_%s" % self.flow_datastore.TYPE.upper()] = datastore_root
+            env[f"METAFLOW_DATASTORE_SYSROOT_{self.flow_datastore.TYPE.upper()}"] = datastore_root
 
         # Metadata service URL — needed when using the service metadata provider.
         try:
@@ -373,7 +375,7 @@ class Temporal:
             for var in ("SERVICE_URL", "SERVICE_INTERNAL_URL", "SERVICE_AUTH_KEY"):
                 val = getattr(mfc, var, None)
                 if val:
-                    env["METAFLOW_%s" % var] = val
+                    env[f"METAFLOW_{var}"] = val
         except Exception:
             pass
 
@@ -503,8 +505,8 @@ class Temporal:
                     flow_name = t.get("flow") or t.get("fq_name")
                     if not flow_name or not isinstance(flow_name, str):
                         warnings.warn(
-                            "@trigger_on_finish entry has a missing or non-string flow name %r — "
-                            "skipping this trigger." % (flow_name,),
+                            f"@trigger_on_finish entry has a missing or non-string flow name {flow_name!r} — "
+                            "skipping this trigger.",
                             UserWarning,
                             stacklevel=2,
                         )
@@ -535,9 +537,8 @@ class Temporal:
                     event_name = t.get("name")
                     if not event_name or not isinstance(event_name, str):
                         warnings.warn(
-                            "@trigger entry has a missing or non-string event name %r — "
-                            "skipping this trigger.  Evaluate the event name before deploying."
-                            % (event_name,),
+                            f"@trigger entry has a missing or non-string event name {event_name!r} — "
+                            "skipping this trigger.  Evaluate the event name before deploying.",
                             UserWarning,
                             stacklevel=2,
                         )

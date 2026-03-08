@@ -58,6 +58,12 @@ class TemporalDeployer(DeployerImpl):
             Maximum concurrent activity workers.
         tags : list[str], optional
             Tags to attach to all runs.
+        branch : str, optional
+            @project branch name. If not provided, falls back to the value
+            from the Deployer top-level kwargs (e.g. when ``Deployer(..., branch=b)``
+            is called by the UX test suite).
+        production : bool, optional
+            Deploy to the @project production branch.
         deployer_attribute_file : str, optional
             Write deployment info JSON here (Metaflow Deployer API internal).
 
@@ -66,5 +72,14 @@ class TemporalDeployer(DeployerImpl):
         TemporalDeployedFlow
         """
         from .temporal_deployer_objects import TemporalDeployedFlow
+
+        # Forward branch/production from top_level_kwargs when not explicitly
+        # given as create() kwargs.  This handles the UX test pattern:
+        #   Deployer(flow_file, branch=b).temporal(...).create()
+        # where branch is a recognised top-level @project CLI option and ends up
+        # in self.top_level_kwargs rather than in deployer_kwargs.
+        for key in ("branch", "production"):
+            if key not in kwargs and key in self.top_level_kwargs:
+                kwargs[key] = self.top_level_kwargs[key]
 
         return self._create(TemporalDeployedFlow, **kwargs)

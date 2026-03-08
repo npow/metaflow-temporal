@@ -2,6 +2,7 @@ import json
 import os
 
 from metaflow import FlowSpec
+
 from metaflow_extensions.temporal.plugins.temporal import step
 
 _LOG_FILE = "/tmp/saga_test_log.json"
@@ -55,7 +56,7 @@ def _append_log(entry: dict):
         try:
             with open(_LOG_FILE) as f:
                 existing = json.load(f)
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
     existing.append(entry)
     with open(_LOG_FILE, "w") as f:

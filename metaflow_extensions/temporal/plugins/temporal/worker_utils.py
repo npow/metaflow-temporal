@@ -20,7 +20,8 @@ from typing import List, Optional
 from temporalio import activity, workflow
 from temporalio.client import Client
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError, CancelledError as TemporalCancelledError
+from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import CancelledError as TemporalCancelledError
 from temporalio.worker import Worker
 
 # ---------------------------------------------------------------------------
@@ -86,6 +87,8 @@ class StepInput:
     tags: Optional[List[str]] = None
     # Metaflow namespace (--namespace flag for step subprocess)
     namespace: str = ""
+    # @project branch name (--branch flag for step subprocess)
+    branch: str = ""
 
 
 @dataclass
@@ -145,6 +148,8 @@ def _top_level_args(inp: StepInput) -> list:
     ]
     if inp.namespace:
         args.append("--namespace=%s" % inp.namespace)
+    if inp.branch:
+        args.append("--branch=%s" % inp.branch)
     # Forward compute/environment backend decorators so that @kubernetes, @batch,
     # @conda, @sandbox, etc. take effect inside the subprocess.
     for spec in (inp.decorator_specs or []):
@@ -167,6 +172,7 @@ class _RuntimeCLIArgs:
             "event-logger": inp.event_logger_type,
             "monitor": inp.monitor_type,
             "with": list(inp.decorator_specs or []) + ["temporal_internal"],
+            **({"branch": inp.branch} if inp.branch else {}),
         }
         self.commands = ["step"]
         self.command_args = [inp.step_name]
@@ -205,6 +211,7 @@ def _runtime_step_decorators(inp: StepInput) -> list:
     """Resolve StepDecorator instances for runtime_step_cli hooks."""
     try:
         import importlib
+
         from metaflow.decorators import StepDecorator, extract_step_decorator_from_decospec
     except Exception:
         return []
@@ -462,6 +469,21 @@ async def _run_subprocess(cmd: list, env: dict) -> tuple:
 @activity.defn(name="run_metaflow_step")
 async def run_metaflow_step(inp: StepInput) -> StepOutput:
     """Execute a single Metaflow step as a Temporal activity."""
+    # Override retry_count with the actual activity attempt number so that
+    # current.retry_count reflects how many times *this specific activity* has
+    # been retried (0-based), not the workflow-level attempt.  The workflow code
+    # always sends retry_count=0 because it cannot observe activity retries; the
+    # activity itself is the only place that knows its true attempt number.
+    actual_retry_count = max(0, activity.info().attempt - 1)
+    if actual_retry_count != inp.retry_count:
+        inp.retry_count = actual_retry_count
+        # Rebuild the task_id to include the actual retry count so each Metaflow
+        # task attempt gets its own slot in the datastore.
+        if inp.split_index >= 0:
+            inp.task_id = "temporal-%s-%d-%d" % (inp.step_name, inp.split_index, actual_retry_count)
+        else:
+            inp.task_id = "temporal-%s-%d" % (inp.step_name, actual_retry_count)
+
     output_fd, output_file = tempfile.mkstemp(suffix=".json")
     os.close(output_fd)
 
@@ -639,6 +661,7 @@ def _make_step_input(
         runtime_cli_decorators=node.get("runtime_cli_decorators", []),
         tags=cfg.get("tags", []),
         namespace=cfg.get("namespace", ""),
+        branch=cfg.get("branch", ""),
     )
 
 
@@ -826,10 +849,37 @@ class MetaflowWorkflow:
                     flat_split_task_ids.append(tid)
             task_ids[body_step] = flat_split_task_ids
 
-            # Continue to join
-            body_node = steps[body_step]
-            join_step = body_node["out_funcs"][0]
-            await self._execute_node(join_step, cfg, run_id, task_ids, params, -1, resume_state)
+            # Find the correct join step using split_parents metadata.  For simple
+            # foreach this is body_step.out_funcs[0], but for nested foreach the
+            # join may be deeper (e.g. outer_join after inner_join).
+            join_step = _find_join_step(step_name, steps)
+            if join_step is None:
+                # Fallback for simple foreach where body directly precedes join
+                body_node = steps[body_step]
+                join_step = body_node["out_funcs"][0] if body_node["out_funcs"] else None
+
+            if join_step is not None:
+                # For nested foreach: each outer slice produced task_ids for all
+                # steps inside that slice (e.g. inner_join from inner foreach).
+                # The outer join needs ALL of those step task_ids aggregated into
+                # lists so _resolve_input_paths can build the correct input_paths.
+                join_node = steps.get(join_step, {})
+                for feed_step in join_node.get("in_funcs", []):
+                    if feed_step == body_step:
+                        continue  # already aggregated above
+                    # Collect this step's task_id from every outer slice.
+                    slice_tids = []
+                    for slice_ids in body_task_ids_list:
+                        tid = slice_ids.get(feed_step)
+                        if tid is not None:
+                            if isinstance(tid, list):
+                                slice_tids.extend(tid)
+                            else:
+                                slice_tids.append(tid)
+                    if slice_tids:
+                        task_ids[feed_step] = slice_tids
+
+                await self._execute_node(join_step, cfg, run_id, task_ids, params, -1, resume_state)
 
         elif node_type == "split-switch":
             # Only one branch runs at runtime.  The run_metaflow_step activity
@@ -881,6 +931,7 @@ class MetaflowWorkflow:
         split_index: int,
         retry_count: int,
         task_ids: dict,
+        slice_prefix: str = "",
     ) -> dict:
         """Execute one slice of a foreach body, handling arbitrary nesting depth.
 
@@ -888,6 +939,14 @@ class MetaflowWorkflow:
         then — if that step is itself a foreach — recursively fans out its body
         steps in parallel.  Returns the accumulated ``task_ids`` dict for this
         slice so the caller can build the join's input_paths.
+
+        Parameters
+        ----------
+        slice_prefix:
+            A string prefix encoding all ancestor foreach split indices
+            (e.g. "0_" for outer slice 0).  Combined with the current
+            split_index to produce a globally unique task_id across all
+            nesting levels.  Empty for top-level foreach slices.
         """
         steps = cfg["steps"]
         node = steps[step_name]
@@ -905,7 +964,12 @@ class MetaflowWorkflow:
         else:
             input_paths = "%s/%s/%s" % (run_id, parent_step, parent_task_id)
 
-        task_id = "temporal-%s-%d-%d" % (step_name, split_index, retry_count)
+        # Build a globally unique task_id by combining the slice_prefix
+        # (encoding all ancestor split indices) with the current split_index.
+        # For top-level foreach: "temporal-outer-0-0" (split=0, retry=0)
+        # For nested foreach:   "temporal-inner-0_0-0" (outer=0, inner=0, retry=0)
+        full_split_key = "%s%d" % (slice_prefix, split_index)
+        task_id = "temporal-%s-%s-%d" % (step_name, full_split_key, retry_count)
         inp = _make_step_input(cfg, node, step_name, run_id, task_id, input_paths, retry_count, split_index, {})
         retry_policy = _make_retry_policy(node)
         timeout_seconds = node.get("timeout_seconds", _DEFAULT_STEP_TIMEOUT_SECONDS)
@@ -922,18 +986,23 @@ class MetaflowWorkflow:
         self._push_compensation(cfg, step_name, out.task_id)
 
         if node_type == "foreach":
-            # Nested foreach: fan out the inner body steps in parallel
+            # Nested foreach: fan out the inner body steps in parallel.
+            # Pass the current slice_prefix + split_index as the prefix for
+            # inner slices so their task_ids encode the full ancestry.
             inner_out_funcs = node["out_funcs"]
             if len(inner_out_funcs) != 1:
                 raise ApplicationError("foreach node must have exactly one out_func")
             inner_body_step = inner_out_funcs[0]
             inner_cardinality = out.foreach_cardinality
+            # Prefix for inner slices: current full_split_key + "_"
+            inner_prefix = "%s_" % full_split_key
 
             inner_task_ids_list = await asyncio.gather(
                 *[
                     self._execute_foreach_slice(
                         inner_body_step, cfg, run_id,
                         inner_split_index, retry_count, dict(task_ids),
+                        slice_prefix=inner_prefix,
                     )
                     for inner_split_index in range(inner_cardinality)
                 ]
@@ -949,10 +1018,38 @@ class MetaflowWorkflow:
                     flat_inner_task_ids.append(tid)
             task_ids[inner_body_step] = flat_inner_task_ids
 
-            # Execute the inner join step
+            # Execute the inner join step directly (not via _execute_node) so that:
+            # 1. The task_id includes the OUTER slice context for uniqueness across
+            #    outer slices (e.g. "temporal-inner_join-0-0" vs "temporal-inner_join-1-0").
+            # 2. We do NOT follow the inner join's out_funcs, which would
+            #    prematurely execute the outer-level join (e.g. outer_join) from
+            #    within this slice — that must be executed by _execute_node after
+            #    ALL outer slices complete.
             inner_body_node = steps[inner_body_step]
             inner_join_step = inner_body_node["out_funcs"][0]
-            await self._execute_node(inner_join_step, cfg, run_id, task_ids, {}, -1)
+            inner_join_node = steps[inner_join_step]
+            inner_join_input_paths = _resolve_input_paths(
+                inner_join_step, inner_join_node, run_id, task_ids, steps=steps
+            )
+            # Include the full outer slice context in the task_id.
+            inner_join_task_id = "temporal-%s-%s-%d" % (inner_join_step, full_split_key, retry_count)
+            inner_join_inp = _make_step_input(
+                cfg, inner_join_node, inner_join_step, run_id,
+                inner_join_task_id, inner_join_input_paths,
+                retry_count, split_index, {}
+            )
+            inner_join_timeout = inner_join_node.get("timeout_seconds", _DEFAULT_STEP_TIMEOUT_SECONDS)
+            inner_join_out: StepOutput = await workflow.execute_activity(
+                run_metaflow_step,
+                inner_join_inp,
+                start_to_close_timeout=timedelta(seconds=inner_join_timeout),
+                heartbeat_timeout=timedelta(seconds=_HEARTBEAT_TIMEOUT_SECONDS),
+                retry_policy=_make_retry_policy(inner_join_node),
+            )
+            task_ids[inner_join_step] = inner_join_out.task_id
+            self._push_compensation(cfg, inner_join_step, inner_join_out.task_id)
+            # Intentionally stop here: the outer join is executed by _execute_node
+            # (for start's foreach) after ALL outer slices complete.
 
         return task_ids
 
@@ -1339,8 +1436,8 @@ class WorkerUtils:
         from temporalio.client import (
             Schedule,
             ScheduleActionStartWorkflow,
-            SchedulePolicy,
             ScheduleOverlapPolicy,
+            SchedulePolicy,
             ScheduleSpec,
         )
 

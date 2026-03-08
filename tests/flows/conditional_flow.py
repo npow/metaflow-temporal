@@ -14,13 +14,13 @@ class ConditionalFlow(FlowSpec):
     @step
     def high_path(self):
         """Path for values >= threshold."""
-        self.result = "high: %s >= %s" % (self.value, self.threshold)
+        self.result = f"high: {self.value} >= {self.threshold}"
         self.next(self.join)
 
     @step
     def low_path(self):
         """Path for values < threshold."""
-        self.result = "low: %s < %s" % (self.value, self.threshold)
+        self.result = f"low: {self.value} < {self.threshold}"
         self.next(self.join)
 
     @step

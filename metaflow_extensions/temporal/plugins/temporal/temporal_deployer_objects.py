@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
-import subprocess
 from typing import TYPE_CHECKING, ClassVar
 
 from metaflow.runner.deployer import DeployedFlow, TriggeredRun
@@ -72,13 +72,13 @@ class TemporalTriggeredRun(TriggeredRun):
         try:
             _, run_id = self.pathspec.split("/")
             if run_id.startswith("temporal-"):
-                workflow_id = run_id[len("temporal-"):]
+                run_id[len("temporal-"):]
                 temporal_host = getattr(self.deployer, "_deployer_kwargs", {}).get(
                     "temporal_host", "localhost:7233"
                 )
                 # Derive UI base URL from temporal_host (strip port, use default UI port 8080)
                 host = temporal_host.split(":")[0]
-                return "http://%s:%d/namespaces/default/workflows/%s" % (host, _TEMPORAL_UI_PORT, workflow_id)
+                return f"http://{host}:{_TEMPORAL_UI_PORT}/namespaces/default/workflows/{host}"
         except Exception:
             pass
         return None
@@ -159,10 +159,12 @@ class TemporalDeployedFlow(DeployedFlow):
         self._ensure_worker_running()
 
         # Convert kwargs to "key=value" strings for --run-param.
-        run_params = tuple("%s=%s" % (k, v) for k, v in kwargs.items())
+        # Use a list (not tuple) so MetaflowAPI.execute() emits separate
+        # --run-param flags for each entry rather than stringifying the tuple.
+        run_params = [f"{k}={v}" for k, v in kwargs.items()]
 
         with temporary_fifo() as (attribute_file_path, attribute_file_fd):
-            trigger_kwargs = dict(name=self.name, deployer_attribute_file=attribute_file_path)
+            trigger_kwargs = {"name": self.name, "deployer_attribute_file": attribute_file_path}
             if run_params:
                 trigger_kwargs["run_params"] = run_params
             additional_info = getattr(self.deployer, "additional_info", {}) or {}
@@ -193,8 +195,7 @@ class TemporalDeployedFlow(DeployedFlow):
                 return TemporalTriggeredRun(deployer=self.deployer, content=content)
 
         raise RuntimeError(
-            "Error triggering Temporal workflow for flow %r"
-            % self.deployer.flow_file
+            f"Error triggering Temporal workflow for flow {self.deployer.flow_file!r}"
         )
 
     trigger = run
@@ -212,6 +213,7 @@ class TemporalDeployedFlow(DeployedFlow):
           worker is already running externally.
         """
         import json
+
         from .temporal_deployer import TemporalDeployer
 
         try:

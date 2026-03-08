@@ -51,7 +51,7 @@ def _resolve_task_queue(obj, task_queue, branch=None, production=False):
     if task_queue is not None:
         return task_queue
     flow_name = _resolve_project_flow_name(obj, branch=branch, production=production)
-    return "metaflow-%s" % flow_name.lower().replace(".", "-")
+    return "metaflow-{}".format(flow_name.lower().replace(".", "-"))
 
 
 @click.group()
@@ -138,7 +138,7 @@ def create(
 ):
     flow_name = obj.graph.name
     if output is None:
-        output = "%s_temporal_worker.py" % flow_name.lower()
+        output = f"{flow_name.lower()}_temporal_worker.py"
 
     t = Temporal(
         name=flow_name,
@@ -167,15 +167,14 @@ def create(
     with open(output, "w") as f:
         f.write(worker_code)
 
-    click.echo("Worker written to: %s" % output)
+    click.echo(f"Worker written to: {output}")
     if t._project_info:
         click.echo(
-            "Project: %s, Branch: %s"
-            % (t._project_info["name"], t._project_info["branch"])
+            "Project: {}, Branch: {}".format(t._project_info["name"], t._project_info["branch"])
         )
-        click.echo("Flow name (in datastore): %s" % t._project_info["flow_name"])
-    click.echo("Start worker:  python %s" % output)
-    click.echo("Trigger run:   python %s trigger [key=value ...]" % output)
+        click.echo("Flow name (in datastore): {}".format(t._project_info["flow_name"]))
+    click.echo(f"Start worker:  python {output}")
+    click.echo(f"Trigger run:   python {output} trigger [key=value ...]")
 
     if deployer_attribute_file:
         with open(deployer_attribute_file, "w") as f:
@@ -204,7 +203,7 @@ async def _do_trigger(temporal_host, temporal_namespace, flow_name, task_queue, 
     from temporalio.client import Client
 
     client = await Client.connect(temporal_host, namespace=temporal_namespace)
-    workflow_id = "%s-%s" % (flow_name.lower(), uuid.uuid4().hex[:8])
+    workflow_id = f"{flow_name.lower()}-{uuid.uuid4().hex[:8]}"
     execution_timeout = timedelta(seconds=workflow_timeout) if workflow_timeout else None
     await client.start_workflow(
         "MetaflowWorkflow",
@@ -213,7 +212,7 @@ async def _do_trigger(temporal_host, temporal_namespace, flow_name, task_queue, 
         task_queue=task_queue,
         execution_timeout=execution_timeout,
     )
-    return "temporal-%s" % workflow_id, workflow_id
+    return f"temporal-{workflow_id}", workflow_id
 
 
 @temporal.command(help="Trigger a run for a previously compiled Temporal worker.")
@@ -287,9 +286,9 @@ def trigger(
     params = _parse_run_params(run_params)
 
     run_id, workflow_id = asyncio.run(_do_trigger(temporal_host, temporal_namespace, flow_name, task_queue, params, workflow_timeout))
-    pathspec = "%s/%s" % (flow_name, run_id)
+    pathspec = f"{flow_name}/{run_id}"
 
-    click.echo("Triggered Temporal workflow: %s (pathspec: %s)" % (workflow_id, pathspec))
+    click.echo(f"Triggered Temporal workflow: {workflow_id} (pathspec: {pathspec})")
 
     if deployer_attribute_file:
         with open(deployer_attribute_file, "w") as f:
@@ -315,7 +314,7 @@ async def _do_resume(temporal_host, temporal_namespace, flow_name, run_id, task_
 
     # Discover which steps completed by inspecting the Metaflow datastore.
     try:
-        mf_run = metaflow.Run("%s/%s" % (flow_name, run_id))
+        mf_run = metaflow.Run(f"{flow_name}/{run_id}")
         resume_state = {}
         for step in mf_run:
             tasks = list(step.tasks())
@@ -325,11 +324,11 @@ async def _do_resume(temporal_host, temporal_namespace, flow_name, run_id, task_
                 else:
                     resume_state[step.id] = {"task_ids": [t.id for t in tasks]}
     except Exception as e:
-        click.echo("Warning: could not read prior run state: %s" % e, err=True)
+        click.echo(f"Warning: could not read prior run state: {e}", err=True)
         resume_state = {}
 
     client = await Client.connect(temporal_host, namespace=temporal_namespace)
-    new_workflow_id = "%s-resume-%s" % (flow_name.lower(), uuid.uuid4().hex[:8])
+    new_workflow_id = f"{flow_name.lower()}-resume-{uuid.uuid4().hex[:8]}"
     execution_timeout = timedelta(seconds=workflow_timeout) if workflow_timeout else None
 
     handle = await client.start_workflow(
@@ -345,10 +344,10 @@ async def _do_resume(temporal_host, temporal_namespace, flow_name, run_id, task_
         task_queue=task_queue,
         execution_timeout=execution_timeout,
     )
-    click.echo("Resumed workflow: %s (original run ID: %s)" % (new_workflow_id, run_id))
+    click.echo(f"Resumed workflow: {new_workflow_id} (original run ID: {run_id})")
     click.echo("Waiting for completion...")
     result = await handle.result()
-    click.echo("Workflow completed. Run ID: %s" % result)
+    click.echo(f"Workflow completed. Run ID: {result}")
     return result
 
 

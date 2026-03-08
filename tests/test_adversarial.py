@@ -5,12 +5,11 @@ These tests are pure-unit (no external services, no subprocesses) and target
 error paths, boundary conditions, and invariants that the happy-path
 integration tests cannot exercise.
 """
-import asyncio
-import sys
-import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+
+from metaflow_extensions.temporal.plugins.temporal.temporal_cli import _parse_run_params
 
 # ---------------------------------------------------------------------------
 # Helpers under test
@@ -24,11 +23,7 @@ from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
     _make_retry_policy,
     _make_step_input,
     _resolve_input_paths,
-    StepInput,
-    StepOutput,
 )
-from metaflow_extensions.temporal.plugins.temporal.temporal_cli import _parse_run_params
-
 
 # ---------------------------------------------------------------------------
 # _build_task_pathspec
@@ -120,6 +115,7 @@ class TestMakeRetryPolicy:
 
     def test_default_delay(self):
         from datetime import timedelta
+
         from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
             _DEFAULT_RETRY_DELAY_SECONDS,
         )
@@ -391,7 +387,6 @@ class TestRunCompensations:
     async def test_failed_compensation_logs_warning(self, capsys):
         from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
             MetaflowWorkflow,
-            CompensationInput,
         )
 
         workflow_mock = MetaflowWorkflow()
@@ -427,7 +422,10 @@ class TestRunCompensations:
 class TestMetaflowDatastoreEnv:
     def test_restores_original_value(self, monkeypatch):
         import os
-        from metaflow_extensions.temporal.plugins.temporal.worker_utils import _metaflow_datastore_env
+
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+            _metaflow_datastore_env,
+        )
 
         monkeypatch.setenv("METAFLOW_DATASTORE_SYSROOT_LOCAL", "/original")
         with _metaflow_datastore_env("/override"):
@@ -436,7 +434,10 @@ class TestMetaflowDatastoreEnv:
 
     def test_removes_key_when_originally_absent(self, monkeypatch):
         import os
-        from metaflow_extensions.temporal.plugins.temporal.worker_utils import _metaflow_datastore_env
+
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+            _metaflow_datastore_env,
+        )
 
         monkeypatch.delenv("METAFLOW_DATASTORE_SYSROOT_LOCAL", raising=False)
         with _metaflow_datastore_env("/temp"):
@@ -445,7 +446,10 @@ class TestMetaflowDatastoreEnv:
 
     def test_restores_on_exception(self, monkeypatch):
         import os
-        from metaflow_extensions.temporal.plugins.temporal.worker_utils import _metaflow_datastore_env
+
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+            _metaflow_datastore_env,
+        )
 
         monkeypatch.setenv("METAFLOW_DATASTORE_SYSROOT_LOCAL", "/original")
         with pytest.raises(ValueError):

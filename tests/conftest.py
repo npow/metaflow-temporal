@@ -1,5 +1,4 @@
 import asyncio
-import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -39,7 +38,7 @@ async def temporal_env():
 @pytest_asyncio.fixture
 async def worker(temporal_env):
     """Worker running the MetaflowWorkflow + run_metaflow_step activity."""
-    task_queue = "test-metaflow-%s" % id(temporal_env)
+    task_queue = f"test-metaflow-{id(temporal_env)}"
     async with Worker(
         temporal_env.client,
         task_queue=task_queue,
