@@ -377,6 +377,23 @@ class Temporal:
         except Exception:
             pass
 
+        # Pass flow config values (--config-value overrides) to each step subprocess
+        # so that config_expr / FlowMutator / @project decorators evaluate correctly
+        # at task runtime.  Mirrors the same fix applied to the Airflow deployer.
+        try:
+            from metaflow.flowspec import FlowStateItems
+
+            flow_configs = self.flow._flow_state[FlowStateItems.CONFIGS]
+            config_env = {
+                name: value
+                for name, (value, _is_plain) in flow_configs.items()
+                if value is not None
+            }
+            if config_env:
+                env["METAFLOW_FLOW_CONFIG_VALUE"] = json.dumps(config_env)
+        except Exception:
+            pass
+
         return env
 
     def _get_timeout(self, node) -> int:

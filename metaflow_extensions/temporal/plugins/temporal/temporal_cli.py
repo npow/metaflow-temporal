@@ -11,16 +11,12 @@ from metaflow.util import get_username
 from .temporal import Temporal
 
 
-def _resolve_task_queue(obj, task_queue, branch=None, production=False):
-    """Return the effective Temporal task queue name.
+def _resolve_project_flow_name(obj, branch=None, production=False):
+    """Return the project-aware flow name for @project flows, or the plain graph name.
 
-    Mirrors the logic in ``Temporal.__init__`` so that ``trigger`` and
-    ``resume`` use the same queue as the compiled worker.  For @project flows
-    the queue name includes the project-aware flow name; for plain flows it is
-    simply ``metaflow-<flowname>``.
+    Mirrors the logic in ``Temporal._get_project()`` so that ``trigger`` and
+    ``resume`` derive the same effective flow name as the compiled worker.
     """
-    if task_queue is not None:
-        return task_queue
     flow_name = obj.graph.name
     try:
         from metaflow.plugins.project_decorator import format_name
@@ -38,9 +34,23 @@ def _resolve_task_queue(obj, task_queue, branch=None, production=False):
                     branch,
                     get_username() or "",
                 )
-                flow_name = project_flow_name
+                return project_flow_name
     except Exception:
         pass
+    return flow_name
+
+
+def _resolve_task_queue(obj, task_queue, branch=None, production=False):
+    """Return the effective Temporal task queue name.
+
+    Mirrors the logic in ``Temporal.__init__`` so that ``trigger`` and
+    ``resume`` use the same queue as the compiled worker.  For @project flows
+    the queue name includes the project-aware flow name; for plain flows it is
+    simply ``metaflow-<flowname>``.
+    """
+    if task_queue is not None:
+        return task_queue
+    flow_name = _resolve_project_flow_name(obj, branch=branch, production=production)
     return "metaflow-%s" % flow_name.lower().replace(".", "-")
 
 
@@ -267,7 +277,12 @@ def trigger(
     production,
 ):
     """Trigger a Temporal workflow run and write run info for the Deployer API."""
-    flow_name = name or obj.graph.name
+    # Use plain name if explicitly given, otherwise derive project-aware name so
+    # the pathspec matches the flow name used by the worker when storing runs.
+    if name:
+        flow_name = name
+    else:
+        flow_name = _resolve_project_flow_name(obj, branch=branch, production=production)
     task_queue = _resolve_task_queue(obj, task_queue, branch=branch, production=production)
     params = _parse_run_params(run_params)
 

@@ -201,12 +201,26 @@ class TemporalDeployedFlow(DeployedFlow):
 
     @classmethod
     def from_deployment(cls, identifier: str, metadata: str | None = None) -> TemporalDeployedFlow:
-        """Recover a TemporalDeployedFlow from a deployment identifier."""
+        """Recover a TemporalDeployedFlow from a deployment identifier.
+
+        ``identifier`` may be either:
+        - A JSON string written by :py:prop:`id` containing ``name``, ``flow_name``,
+          ``flow_file``, and optional ``additional_info`` keys.
+        - A plain flow name string (e.g. ``"HelloWorld"``), as returned by
+          ``deployed_flow.deployer.name``.  In this case the flow_file is unknown
+          and the recovered deployer can only be used to trigger new runs if the
+          worker is already running externally.
+        """
         import json
         from .temporal_deployer import TemporalDeployer
 
-        info = json.loads(identifier)
-        deployer = TemporalDeployer(flow_file=info["flow_file"], deployer_kwargs={})
+        try:
+            info = json.loads(identifier)
+        except (ValueError, TypeError):
+            # Plain name string — build a minimal info dict.
+            info = {"name": identifier, "flow_name": identifier, "flow_file": None}
+
+        deployer = TemporalDeployer(flow_file=info.get("flow_file"), deployer_kwargs={})
         deployer.name = info["name"]
         deployer.flow_name = info["flow_name"]
         deployer.metadata = metadata or "{}"
