@@ -11,13 +11,11 @@ external Temporal server at localhost:7233.
 import json
 import os
 import sys
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import metaflow
 import pytest
-import pytest_asyncio
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 # Use local datastore/metadata for all tests
@@ -26,7 +24,7 @@ metaflow.metadata("local")
 # Ensure the test flows are importable
 FLOWS_DIR = Path(__file__).parent / "flows"
 
-from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+from metaflow_extensions.temporal.plugins.temporal.worker_utils import (  # noqa: E402
     MetaflowWorkflow,
     run_metaflow_step,
 )
@@ -34,7 +32,9 @@ from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
 
 def _build_config(flow_file: Path, flow_name: str, task_queue: str) -> dict:
     """Build a minimal CONFIG dict by running `metaflow temporal create` inline."""
-    import subprocess, tempfile, sys
+    import subprocess
+    import sys
+    import tempfile
 
     out_file = tempfile.mktemp(suffix="_worker.py")
     result = subprocess.run(
@@ -55,16 +55,13 @@ def _build_config(flow_file: Path, flow_name: str, task_queue: str) -> dict:
         text=True,
     )
     assert result.returncode == 0, (
-        "temporal create failed:\nSTDOUT: %s\nSTDERR: %s" % (result.stdout, result.stderr)
+        f"temporal create failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
     )
 
     # Extract CONFIG from the generated file
-    ns = {}
-    exec(open(out_file).read().split("{{{utils}}}")[0] if "{{{utils}}}" in open(out_file).read() else
-         # Parse CONFIG = ... block
-         _extract_config_block(out_file), ns)
+    config = _extract_config_from_worker(out_file)
     os.unlink(out_file)
-    return ns.get("CONFIG", {})
+    return config
 
 
 def _extract_config_from_worker(worker_file: str) -> dict:
@@ -88,7 +85,9 @@ async def _run_flow(
     params: dict,
 ) -> str:
     """Compile a flow, then run it via the in-process client."""
-    import subprocess, tempfile, uuid
+    import subprocess
+    import tempfile
+    import uuid
 
     out_file = tempfile.mktemp(suffix="_worker.py")
     try:
@@ -110,8 +109,7 @@ async def _run_flow(
             text=True,
         )
         assert result.returncode == 0, (
-            "temporal create failed:\nSTDOUT: %s\nSTDERR: %s"
-            % (result.stdout, result.stderr)
+            f"temporal create failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
         )
 
         config = _extract_config_from_worker(out_file)
@@ -121,7 +119,7 @@ async def _run_flow(
         except OSError:
             pass
 
-    workflow_id = "%s-%s" % (flow_name.lower(), uuid.uuid4().hex[:8])
+    workflow_id = f"{flow_name.lower()}-{uuid.uuid4().hex[:8]}"
     run_id = await client.execute_workflow(
         MetaflowWorkflow.run,
         {"config": config, "params": params},
@@ -156,7 +154,7 @@ async def _get_config(client, task_queue: str, flow_file: Path, flow_name: str) 
             text=True,
         )
         assert result.returncode == 0, (
-            "temporal create failed:\nSTDOUT: %s\nSTDERR: %s" % (result.stdout, result.stderr)
+            f"temporal create failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
         )
         return _extract_config_from_worker(out_file)
     finally:
@@ -193,7 +191,7 @@ class TestLinearFlow:
             {},
         )
         # Load the run and check that 'result' artifact exists
-        run = metaflow.Run("LinearFlow/%s" % run_id)
+        run = metaflow.Run(f"LinearFlow/{run_id}")
         assert run["end"].task.data.result == "hello world"
 
 
@@ -222,7 +220,7 @@ class TestBranchFlow:
             "BranchFlow",
             {},
         )
-        run = metaflow.Run("BranchFlow/%s" % run_id)
+        run = metaflow.Run(f"BranchFlow/{run_id}")
         step_names = {s.id for s in run}
         assert "branch_a" in step_names
         assert "branch_b" in step_names
@@ -253,7 +251,7 @@ class TestForeachFlow:
             "ForeachFlow",
             {},
         )
-        run = metaflow.Run("ForeachFlow/%s" % run_id)
+        run = metaflow.Run(f"ForeachFlow/{run_id}")
         body_tasks = list(run["body"].tasks())
         assert len(body_tasks) == 3
         results = [t.data.result for t in body_tasks]
@@ -275,7 +273,7 @@ class TestParamFlow:
             "ParamFlow",
             {},
         )
-        run = metaflow.Run("ParamFlow/%s" % run_id)
+        run = metaflow.Run(f"ParamFlow/{run_id}")
         assert run["end"].task.data.message == "hello, world"
 
     @pytest.mark.asyncio
@@ -288,7 +286,7 @@ class TestParamFlow:
             "ParamFlow",
             {"greeting": "Temporal"},
         )
-        run = metaflow.Run("ParamFlow/%s" % run_id)
+        run = metaflow.Run(f"ParamFlow/{run_id}")
         assert run["end"].task.data.message == "hello, Temporal"
 
 
@@ -641,7 +639,7 @@ class TestConditionalFlow:
             "ConditionalFlow",
             {},
         )
-        run = metaflow.Run("ConditionalFlow/%s" % run_id)
+        run = metaflow.Run(f"ConditionalFlow/{run_id}")
         step_names = {s.id for s in run}
         assert "high_path" in step_names
         assert "low_path" in step_names
@@ -662,7 +660,7 @@ class TestConditionalFlow:
             "ConditionalFlow",
             {"threshold": "5"},
         )
-        run = metaflow.Run("ConditionalFlow/%s" % run_id)
+        run = metaflow.Run(f"ConditionalFlow/{run_id}")
         results = sorted(run["join"].task.data.results)
         # value=15, threshold=5 → high path has "15 >= 5"
         assert any("15 >= 5" in r for r in results)
@@ -700,7 +698,7 @@ class TestSwitchFlow:
             "SwitchFlow",
             {},
         )
-        run = metaflow.Run("SwitchFlow/%s" % run_id)
+        run = metaflow.Run(f"SwitchFlow/{run_id}")
         step_names = {s.id for s in run}
         # high ran, low did NOT run
         assert "high" in step_names
@@ -719,7 +717,7 @@ class TestSwitchFlow:
             "SwitchFlow",
             {"value": "3"},
         )
-        run = metaflow.Run("SwitchFlow/%s" % run_id)
+        run = metaflow.Run(f"SwitchFlow/{run_id}")
         step_names = {s.id for s in run}
         assert "low" in step_names
         assert "high" not in step_names
@@ -736,7 +734,7 @@ class TestSwitchFlow:
             "SwitchFlow",
             {"value": "7"},
         )
-        run = metaflow.Run("SwitchFlow/%s" % run_id)
+        run = metaflow.Run(f"SwitchFlow/{run_id}")
         result = run["merge"].task.data.result
         assert "high" in result
         assert "7" in result
@@ -809,7 +807,7 @@ class TestConfigAndArtifacts:
             "ConfigFlow",
             {},
         )
-        run = metaflow.Run("ConfigFlow/%s" % run_id)
+        run = metaflow.Run(f"ConfigFlow/{run_id}")
         task = run["compute"].task.data
         assert task.total == 30  # [1,2,3,4,5] * 2, sum = 30
         assert task.config_label == "test"
@@ -824,7 +822,7 @@ class TestConfigAndArtifacts:
             "ConfigFlow",
             {"multiplier": "3", "label": "prod"},
         )
-        run = metaflow.Run("ConfigFlow/%s" % run_id)
+        run = metaflow.Run(f"ConfigFlow/{run_id}")
         task = run["compute"].task.data
         assert task.total == 45  # [1,2,3,4,5] * 3, sum = 45
         assert task.config_label == "prod"
@@ -839,7 +837,7 @@ class TestConfigAndArtifacts:
             "ArtifactFlow",
             {},
         )
-        run = metaflow.Run("ArtifactFlow/%s" % run_id)
+        run = metaflow.Run(f"ArtifactFlow/{run_id}")
         # Check start step artifacts
         start_data = run["start"].task.data
         assert start_data.int_val == 42
@@ -864,7 +862,7 @@ class TestConfigAndArtifacts:
             "ForeachFlow",
             {},
         )
-        run = metaflow.Run("ForeachFlow/%s" % run_id)
+        run = metaflow.Run(f"ForeachFlow/{run_id}")
         body_tasks = list(run["body"].tasks())
         assert len(body_tasks) == 3
         results = sorted(t.data.result for t in body_tasks)
@@ -885,7 +883,7 @@ class TestConfigAndArtifacts:
             "BranchFlow",
             {},
         )
-        run = metaflow.Run("BranchFlow/%s" % run_id)
+        run = metaflow.Run(f"BranchFlow/{run_id}")
         # Verify branch artifacts
         branch_a_data = run["branch_a"].task.data
         assert branch_a_data.result_a == "hello from A"
@@ -925,7 +923,7 @@ class TestSagaCompilation:
             text=True,
         )
         assert result.returncode == 0, (
-            "temporal create failed:\nSTDOUT: %s\nSTDERR: %s" % (result.stdout, result.stderr)
+            f"temporal create failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
         )
         return _extract_config_from_worker(out_file)
 
@@ -995,7 +993,7 @@ class TestSagaExecution:
         assert "cancel_b" in actions, "cancel_b compensation did not run"
         # LIFO order: cancel_b runs before cancel_a
         assert actions.index("cancel_b") < actions.index("cancel_a"), (
-            "Compensations did not run in LIFO order: %s" % actions
+            f"Compensations did not run in LIFO order: {actions}"
         )
         # Artifacts were injected correctly
         cancel_b_entry = next(e for e in log if e["action"] == "cancel_b")
@@ -1049,7 +1047,7 @@ class TestResumeFlow:
         assert run_id.startswith("temporal-")
 
         # Discover start's task_id from the Metaflow datastore
-        mf_run = metaflow.Run("LinearFlow/%s" % run_id)
+        mf_run = metaflow.Run(f"LinearFlow/{run_id}")
         start_step = mf_run["start"]
         start_task = list(start_step.tasks())[0]
         start_task_id = start_task.id
@@ -1059,7 +1057,7 @@ class TestResumeFlow:
 
         # Resume: seed start so it is skipped, re-run process + end
         import uuid
-        resume_wf_id = "linearflow-resume-%s" % uuid.uuid4().hex[:8]
+        resume_wf_id = f"linearflow-resume-{uuid.uuid4().hex[:8]}"
         resume_run_id = await client.execute_workflow(
             MetaflowWorkflow.run,
             {
@@ -1076,7 +1074,7 @@ class TestResumeFlow:
         assert resume_run_id == run_id
 
         # Artifacts from resumed run should be present and correct
-        mf_resume = metaflow.Run("LinearFlow/%s" % resume_run_id)
+        mf_resume = metaflow.Run(f"LinearFlow/{resume_run_id}")
         end_task = list(mf_resume["end"].tasks())[0]
         assert end_task.data.result == "hello world"
 
@@ -1089,7 +1087,7 @@ class TestResumeFlow:
             client, task_queue, FLOWS_DIR / "linear_flow.py", "LinearFlow", {}
         )
 
-        mf_run = metaflow.Run("LinearFlow/%s" % run_id)
+        mf_run = metaflow.Run(f"LinearFlow/{run_id}")
         resume_state = {}
         for step in mf_run:
             tasks = list(step.tasks())
@@ -1099,7 +1097,7 @@ class TestResumeFlow:
         config = await _get_config(client, task_queue, FLOWS_DIR / "linear_flow.py", "LinearFlow")
 
         import uuid
-        resume_wf_id = "linearflow-noop-%s" % uuid.uuid4().hex[:8]
+        resume_wf_id = f"linearflow-noop-{uuid.uuid4().hex[:8]}"
         result = await client.execute_workflow(
             MetaflowWorkflow.run,
             {
@@ -1154,11 +1152,11 @@ class TestForeachSagaExecution:
 
         # Both body slices should have been compensated
         assert actions.count("cancel_body") == 2, (
-            "Expected 2 cancel_body compensations, got: %s" % actions
+            f"Expected 2 cancel_body compensations, got: {actions}"
         )
         # Both items should appear in the log
         assert set(items) == {"item-a", "item-b"}, (
-            "Expected items item-a and item-b, got: %s" % items
+            f"Expected items item-a and item-b, got: {items}"
         )
 
 
@@ -1234,6 +1232,7 @@ class TestIntegrationExternal:
     @pytest.fixture(scope="class")
     def ext_client(self):
         import asyncio
+
         from temporalio.client import Client
 
         async def _connect():
@@ -1243,11 +1242,9 @@ class TestIntegrationExternal:
 
     def test_linear_flow_external(self, ext_client, tmp_path):
         import asyncio
-        from concurrent.futures import ThreadPoolExecutor
-        from temporalio.worker import Worker
 
         async def run():
-            task_queue = "integration-test-%s" % id(self)
+            task_queue = f"integration-test-{id(self)}"
             async with Worker(
                 ext_client,
                 task_queue=task_queue,

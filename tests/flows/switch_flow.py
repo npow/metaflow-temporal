@@ -26,12 +26,12 @@ class SwitchFlow(FlowSpec):
 
     @step
     def high(self):
-        self.result = "high: %d > 5" % self.value
+        self.result = f"high: {self.value} > 5"
         self.next(self.merge)
 
     @step
     def low(self):
-        self.result = "low: %d <= 5" % self.value
+        self.result = f"low: {self.value} <= 5"
         self.next(self.merge)
 
     @step
