@@ -168,7 +168,7 @@ class TemporalDeployedFlow(DeployedFlow):
             if run_params:
                 trigger_kwargs["run_params"] = run_params
             additional_info = getattr(self.deployer, "additional_info", {}) or {}
-            for key in ("temporal_host", "task_queue"):
+            for key in ("temporal_host", "task_queue", "temporal_namespace"):
                 val = additional_info.get(key)
                 if val:
                     trigger_kwargs[key] = val
@@ -208,23 +208,55 @@ class TemporalDeployedFlow(DeployedFlow):
         - A JSON string written by :py:prop:`id` containing ``name``, ``flow_name``,
           ``flow_file``, and optional ``additional_info`` keys.
         - A plain flow name string (e.g. ``"HelloWorld"``), as returned by
-          ``deployed_flow.deployer.name``.  In this case the flow_file is unknown
-          and the recovered deployer can only be used to trigger new runs if the
-          worker is already running externally.
+          ``deployed_flow.deployer.name``.  In this case the local deployment
+          metadata written by ``temporal create`` is consulted to recover the
+          flow file path and connection details.
         """
         import json
+        import tempfile
 
+        from metaflow.runner.deployer import generate_fake_flow_file_contents
+
+        from .temporal_cli import _read_deployment_metadata
         from .temporal_deployer import TemporalDeployer
 
         try:
             info = json.loads(identifier)
         except (ValueError, TypeError):
-            # Plain name string — build a minimal info dict.
-            info = {"name": identifier, "flow_name": identifier, "flow_file": None}
+            # Plain name string — look up local deployment metadata.
+            stored = _read_deployment_metadata(identifier) or {}
+            info = {
+                "name": identifier,
+                "flow_name": stored.get("flow_name", identifier),
+                "flow_file": stored.get("flow_file"),
+                "task_queue": stored.get("task_queue"),
+                "temporal_host": stored.get("temporal_host"),
+                "temporal_namespace": stored.get("temporal_namespace"),
+                "worker_file": stored.get("worker_file"),
+                "effective_flow_name": stored.get("effective_flow_name"),
+            }
+            # Remove None values so they don't pollute additional_info.
+            info = {k: v for k, v in info.items() if v is not None}
 
-        deployer = TemporalDeployer(flow_file=info.get("flow_file"), deployer_kwargs={})
-        deployer.name = info["name"]
-        deployer.flow_name = info["flow_name"]
+        flow_file = info.get("flow_file")
+        flow_name = info.get("flow_name", info.get("name", identifier))
+
+        # If the original flow file is unavailable, generate a minimal fake one
+        # so that the Metaflow CLI can be initialised (required by TemporalDeployer).
+        # The fake file only needs to satisfy the CLI's graph-parsing step; the
+        # actual flow code runs inside the worker, not in this process.
+        if not flow_file or not os.path.isfile(flow_file):
+            fake_contents = generate_fake_flow_file_contents(
+                flow_name=flow_name, param_info={}
+            )
+            tmp = tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w")
+            tmp.write(fake_contents)
+            tmp.close()
+            flow_file = tmp.name
+
+        deployer = TemporalDeployer(flow_file=flow_file, deployer_kwargs={})
+        deployer.name = info.get("name", identifier)
+        deployer.flow_name = flow_name
         deployer.metadata = metadata or "{}"
         deployer.additional_info = {
             k: v for k, v in info.items()

@@ -54,6 +54,52 @@ def _resolve_task_queue(obj, task_queue, branch=None, production=False):
     return "metaflow-{}".format(flow_name.lower().replace(".", "-"))
 
 
+def _deployment_metadata_path(name: str) -> str:
+    """Return the path to the local deployment metadata file for *name*."""
+    deploy_dir = os.path.join(os.path.expanduser("~"), ".metaflow", "temporal_deployments")
+    os.makedirs(deploy_dir, exist_ok=True)
+    return os.path.join(deploy_dir, f"{name}.json")
+
+
+def _write_deployment_metadata(
+    name: str,
+    flow_file: str,
+    flow_name: str,
+    effective_flow_name: str,
+    task_queue: str,
+    temporal_host: str,
+    temporal_namespace: str,
+    worker_file: str,
+) -> None:
+    """Persist deployment metadata so that from_deployment() can recover it."""
+    path = _deployment_metadata_path(name)
+    with open(path, "w") as f:
+        json.dump(
+            {
+                "name": name,
+                "flow_file": flow_file,
+                "flow_name": flow_name,
+                "effective_flow_name": effective_flow_name,
+                "task_queue": task_queue,
+                "temporal_host": temporal_host,
+                "temporal_namespace": temporal_namespace,
+                "worker_file": worker_file,
+            },
+            f,
+            indent=2,
+        )
+
+
+def _read_deployment_metadata(name: str) -> dict | None:
+    """Read deployment metadata written by _write_deployment_metadata, or None."""
+    path = _deployment_metadata_path(name)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 @click.group()
 def cli():
     pass
@@ -176,6 +222,19 @@ def create(
     click.echo(f"Start worker:  python {output}")
     click.echo(f"Trigger run:   python {output} trigger [key=value ...]")
 
+    # Write a local metadata file so that from_deployment() can recover
+    # the flow file path, task queue, and temporal host from just the flow name.
+    _write_deployment_metadata(
+        name=flow_name,
+        flow_file=os.path.abspath(sys.argv[0]),
+        flow_name=flow_name,
+        effective_flow_name=t._effective_flow_name,
+        task_queue=t.task_queue,
+        temporal_host=temporal_host,
+        temporal_namespace=temporal_namespace,
+        worker_file=os.path.abspath(output),
+    )
+
     if deployer_attribute_file:
         with open(deployer_attribute_file, "w") as f:
             json.dump(
@@ -187,6 +246,7 @@ def create(
                         "worker_file": os.path.abspath(output),
                         "task_queue": t.task_queue,
                         "temporal_host": temporal_host,
+                        "temporal_namespace": temporal_namespace,
                     },
                 },
                 f,
