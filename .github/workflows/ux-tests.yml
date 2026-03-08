@@ -6,32 +6,73 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    - cron: "0 6 * * *"  # nightly — catches upstream metaflow regressions
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
+env:
+  METAFLOW_DEFAULT_METADATA: local
+  METAFLOW_DEFAULT_DATASTORE: local
+  METAFLOW_DEFAULT_ENVIRONMENT: local
+
 jobs:
-  ux-tests:
+  runner-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    env:
-      METAFLOW_DEFAULT_METADATA: local
-      METAFLOW_DEFAULT_DATASTORE: local
-      METAFLOW_DEFAULT_ENVIRONMENT: local
-
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Pin Metaflow local datastore root
         run: echo "METAFLOW_DATASTORE_SYSROOT_LOCAL=$HOME" >> "$GITHUB_ENV"
+      - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
+        with:
+          metaflow-ref: npow/corral-devstack
+          extra-install: "."
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          pytest-args: "-n 4 -v --tb=short --timeout=120 -k 'runner' --cov-fail-under=0"
+          ux-test-config: |
+            backends:
+              - name: temporal
+                scheduler_type: temporal
+                cluster: null
+                decospec: null
+                deploy_args:
+                  temporal_host: "localhost:7233"
+                enabled: true
 
+  deployer-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - test_hello_world
+          - test_hello_project
+          - test_from_deployment
+          - test_retry
+          - test_resources
+          - test_catch
+          - test_timeout
+          - test_config_simple_default
+          - test_config_simple_config_value
+          - test_config_simple_config
+          - test_mutable_flow_default
+          - test_mutable_flow_config_value
+          - test_config_corner_cases
+          - test_branch
+          - test_foreach
+          - test_nested_foreach
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Pin Metaflow local datastore root
+        run: echo "METAFLOW_DATASTORE_SYSROOT_LOCAL=$HOME" >> "$GITHUB_ENV"
       - name: Start Temporal
         run: docker compose up -d postgresql temporal
-
       - name: Wait for Temporal to be ready
         run: |
           pip install temporalio
@@ -51,12 +92,11 @@ jobs:
               sys.exit(1)
           asyncio.run(wait())
           EOF
-
       - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
         with:
           metaflow-ref: npow/corral-devstack
           extra-install: "."
-          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          pytest-args: "-v --tb=short --timeout=120 -k '${{ matrix.test }} and deployer' --cov-fail-under=0"
           ux-test-config: |
             backends:
               - name: temporal
@@ -66,11 +106,9 @@ jobs:
                 deploy_args:
                   temporal_host: "localhost:7233"
                 enabled: true
-
       - name: Show Temporal logs on failure
         if: failure()
         run: docker compose logs temporal
-
       - name: Tear down
         if: always()
         run: docker compose down -v
