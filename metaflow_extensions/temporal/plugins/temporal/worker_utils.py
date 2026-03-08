@@ -683,7 +683,7 @@ class MetaflowWorkflow:
         resume_state: Optional[dict] = None,
         run_id_override: Optional[str] = None,
     ) -> str:
-        run_id = run_id_override or "temporal-%s" % workflow.info().workflow_id[:20]
+        run_id = run_id_override or "temporal-%s" % workflow.info().workflow_id
         # Seed task_ids from resume_state so that already-completed steps are
         # skipped and their task_ids are available for input_paths resolution.
         task_ids: dict = {}
