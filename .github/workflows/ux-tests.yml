@@ -99,6 +99,7 @@ jobs:
           metaflow-ref: npow/corral-devstack
           extra-install: "."
           pytest-args: "-v --tb=short --timeout=300 -k '${{ matrix.test }} and deployer' --cov-fail-under=0"
+          coverage-artifact-suffix: ${{ matrix.test }}
           ux-test-config: |
             backends:
               - name: temporal
