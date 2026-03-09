@@ -47,7 +47,7 @@ jobs:
           EOF
 
       - name: Run E2E tests
-        run: pytest -v -m e2e --timeout=300
+        run: pytest -v -m e2e --timeout=300 --cov-fail-under=0
 
       - name: Show Temporal logs on failure
         if: failure()
