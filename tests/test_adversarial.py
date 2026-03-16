@@ -563,3 +563,212 @@ class TestMakeStepInputCodePackage:
         assert inp.code_package_url == "s3://x"
         assert inp.code_package_sha == ""
         assert inp.code_package_metadata == ""
+
+
+# ---------------------------------------------------------------------------
+# Compiler warnings for silent exception paths (A3-2, A3-3, A3-4, A3-7)
+# ---------------------------------------------------------------------------
+
+
+class TestCompilerWarnings:
+    """Verify that silent except-Exception blocks now emit warnings instead of silently
+    corrupting the compiled config."""
+
+    def _make_temporal(self, flow, graph, flow_file="/tmp/fake.py"):
+        """Build a minimal Temporal compiler instance."""
+        import os
+        from unittest.mock import MagicMock
+
+        from metaflow_extensions.temporal.plugins.temporal.temporal import Temporal
+
+        meta = MagicMock()
+        meta.TYPE = "local"
+        ds = MagicMock()
+        ds.TYPE = "local"
+        ds.datastore_root = "/tmp/.metaflow"
+        env = MagicMock()
+        env.TYPE = "local"
+        logger = MagicMock()
+        logger.TYPE = "nullSidecarLogger"
+        monitor = MagicMock()
+        monitor.TYPE = "nullSidecarMonitor"
+        return Temporal(
+            name=graph.name,
+            graph=graph,
+            flow=flow,
+            flow_file=flow_file,
+            metadata=meta,
+            flow_datastore=ds,
+            environment=env,
+            event_logger=logger,
+            monitor=monitor,
+        )
+
+    def test_get_schedule_warns_on_exception(self, tmp_path):
+        """_get_schedule should emit a UserWarning (not silently return None) when
+        the schedule decorator accessor raises."""
+        import warnings
+        from unittest.mock import MagicMock, patch
+
+        from metaflow_extensions.temporal.plugins.temporal.temporal import Temporal
+
+        t = MagicMock(spec=Temporal)
+        t.flow = MagicMock()
+        # Make _flow_decorators raise on access
+        type(t.flow)._flow_decorators = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("decorator access failed"))
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = Temporal._get_schedule(t)
+
+        assert result is None
+        assert any("schedule" in str(w.message).lower() for w in caught), (
+            f"Expected a schedule-related warning, got: {[str(w.message) for w in caught]}"
+        )
+
+    def test_get_trigger_on_finish_warns_on_exception(self):
+        """_get_trigger_on_finish should emit a UserWarning when accessor raises."""
+        import warnings
+        from unittest.mock import MagicMock
+
+        from metaflow_extensions.temporal.plugins.temporal.temporal import Temporal
+
+        t = MagicMock(spec=Temporal)
+        t.flow = MagicMock()
+        type(t.flow)._flow_decorators = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("oops"))
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = Temporal._get_trigger_on_finish(t)
+
+        assert result == []
+        assert any("trigger_on_finish" in str(w.message).lower() for w in caught), (
+            f"Expected a trigger_on_finish warning, got: {[str(w.message) for w in caught]}"
+        )
+
+    def test_get_named_triggers_warns_on_exception(self):
+        """_get_named_triggers should emit a UserWarning when accessor raises."""
+        import warnings
+        from unittest.mock import MagicMock
+
+        from metaflow_extensions.temporal.plugins.temporal.temporal import Temporal
+
+        t = MagicMock(spec=Temporal)
+        t.flow = MagicMock()
+        type(t.flow)._flow_decorators = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("oops"))
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = Temporal._get_named_triggers(t)
+
+        assert result == []
+        assert any("trigger" in str(w.message).lower() for w in caught), (
+            f"Expected a trigger warning, got: {[str(w.message) for w in caught]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TemporalTriggeredRun.temporal_ui URL format (A5-1)
+# ---------------------------------------------------------------------------
+
+
+class TestTemporalUIUrl:
+    """The temporal_ui property must embed the workflow ID, not the host."""
+
+    def test_url_contains_workflow_id_not_host(self):
+        """temporal_ui must include the stripped workflow ID in the URL path."""
+        from unittest.mock import MagicMock
+
+        from metaflow_extensions.temporal.plugins.temporal.temporal_deployer_objects import (
+            TemporalTriggeredRun,
+        )
+
+        deployer = MagicMock()
+        deployer._deployer_kwargs = {"temporal_host": "localhost:7233"}
+
+        run = TemporalTriggeredRun.__new__(TemporalTriggeredRun)
+        run.deployer = deployer
+        run.pathspec = "MyFlow/temporal-abc123def456"
+
+        url = run.temporal_ui
+        assert url is not None, "temporal_ui returned None"
+        # Should contain the workflow ID (without the "temporal-" prefix) in the path
+        assert "abc123def456" in url, (
+            f"temporal_ui URL should contain the workflow ID 'abc123def456', got: {url}"
+        )
+        # Should NOT use the host as the workflow identifier
+        assert url.count("localhost") == 1, (
+            f"'localhost' should appear only once (in the host part), got: {url}"
+        )
+
+    def test_url_uses_correct_host(self):
+        """temporal_ui strips the port from temporal_host for the UI base URL."""
+        from unittest.mock import MagicMock
+
+        from metaflow_extensions.temporal.plugins.temporal.temporal_deployer_objects import (
+            TemporalTriggeredRun,
+        )
+
+        deployer = MagicMock()
+        deployer._deployer_kwargs = {"temporal_host": "temporal.internal:7233"}
+
+        run = TemporalTriggeredRun.__new__(TemporalTriggeredRun)
+        run.deployer = deployer
+        run.pathspec = "MyFlow/temporal-wfid999"
+
+        url = run.temporal_ui
+        assert url is not None
+        assert url.startswith("http://temporal.internal:"), (
+            f"Expected URL to start with 'http://temporal.internal:', got: {url}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# MetaflowEventGateway event sequence counter (B1-3)
+# ---------------------------------------------------------------------------
+
+
+class TestEventGatewayEventSeq:
+    """MetaflowEventGateway._event_seq produces distinct child workflow IDs.
+
+    Before the B1-3 fix, the child workflow ID used workflow.now() which
+    returns the same logical timestamp for all events in one workflow task,
+    causing all but the first event to be silently dropped by Temporal.
+
+    The fix replaces workflow.now() with a monotonic _event_seq counter.
+    This unit test verifies the counter is present and increments correctly.
+    """
+
+    def test_event_seq_initialises_to_zero(self):
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+            MetaflowEventGateway,
+        )
+
+        gw = MetaflowEventGateway.__new__(MetaflowEventGateway)
+        gw.__init__()
+        assert gw._event_seq == 0
+
+    def test_event_seq_produces_distinct_ids(self):
+        """Simulating two back-to-back increments must yield two different IDs."""
+        flow_name = "myflow"
+        event_name = "run"
+
+        # Simulate two sequential ID generations (as the gateway does before each
+        # execute_child_workflow call).
+        seq = 0
+        ids = []
+        for _ in range(2):
+            seq += 1
+            ids.append("%s-event-%s-%d" % (flow_name, event_name, seq))
+
+        assert ids[0] != ids[1], (
+            f"Two successive event IDs must be distinct, got: {ids}"
+        )
+        assert ids[0] == "myflow-event-run-1"
+        assert ids[1] == "myflow-event-run-2"

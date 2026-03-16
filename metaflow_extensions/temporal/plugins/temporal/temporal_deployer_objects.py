@@ -72,13 +72,13 @@ class TemporalTriggeredRun(TriggeredRun):
         try:
             _, run_id = self.pathspec.split("/")
             if run_id.startswith("temporal-"):
-                run_id[len("temporal-"):]
+                workflow_id = run_id[len("temporal-"):]
                 temporal_host = getattr(self.deployer, "_deployer_kwargs", {}).get(
                     "temporal_host", "localhost:7233"
                 )
                 # Derive UI base URL from temporal_host (strip port, use default UI port 8080)
                 host = temporal_host.split(":")[0]
-                return f"http://{host}:{_TEMPORAL_UI_PORT}/namespaces/default/workflows/{host}"
+                return f"http://{host}:{_TEMPORAL_UI_PORT}/namespaces/default/workflows/{workflow_id}"
         except Exception:
             pass
         return None
@@ -138,11 +138,17 @@ class TemporalDeployedFlow(DeployedFlow):
             [sys.executable, worker_file],
             env=env,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
         self.deployer._worker_process = proc
         # Give the worker time to connect to Temporal and register its task queue.
         time.sleep(_WORKER_STARTUP_WAIT_SECONDS)
+        if proc.poll() is not None:
+            stderr_out = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+            raise RuntimeError(
+                f"Temporal worker process exited immediately (code {proc.returncode}). "
+                f"Worker file: {worker_file!r}. Stderr: {stderr_out[-2000:]}"
+            )
 
     def run(self, **kwargs) -> TemporalTriggeredRun:
         """Trigger a new run of this deployed flow.

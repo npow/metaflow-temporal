@@ -404,8 +404,13 @@ class Temporal:
                 limit = get_run_time_limit_for_task(node.decorators)
                 if limit:
                     return limit
-        except Exception:
-            pass
+        except Exception as e:
+            warnings.warn(
+                f"Failed to extract @timeout for step '{node.name}': {e}. "
+                f"Using default timeout of {_DEFAULT_STEP_TIMEOUT_SECONDS}s.",
+                UserWarning,
+                stacklevel=2,
+            )
         return _DEFAULT_STEP_TIMEOUT_SECONDS
 
     def _get_retries(self, node) -> int:
@@ -441,8 +446,13 @@ class Temporal:
                 cron = raw
             if cron:
                 return {"cron": cron, "timezone": timezone}
-        except Exception:
-            pass
+        except Exception as e:
+            warnings.warn(
+                f"Failed to extract @schedule config: {e}. "
+                "The flow will not be registered with a Temporal Schedule.",
+                UserWarning,
+                stacklevel=2,
+            )
         return None
 
     def _get_project(self) -> dict | None:
@@ -512,8 +522,13 @@ class Temporal:
                         )
                         continue
                     results.append({"flow": flow_name})
-        except Exception:
-            pass
+        except Exception as e:
+            warnings.warn(
+                f"Failed to extract @trigger_on_finish config: {e}. "
+                "Cross-flow triggers will be disabled for this deployment.",
+                UserWarning,
+                stacklevel=2,
+            )
         return results
 
     def _get_named_triggers(self) -> list:
@@ -547,8 +562,13 @@ class Temporal:
                     raw_params = t.get("parameters") or {}
                     param_map = dict(raw_params) if isinstance(raw_params, dict) else {}
                     results.append({"event": event_name, "parameters": param_map})
-        except Exception:
-            pass
+        except Exception as e:
+            warnings.warn(
+                f"Failed to extract @trigger event config: {e}. "
+                "Named event triggers will be disabled for this deployment.",
+                UserWarning,
+                stacklevel=2,
+            )
         return results
 
     def _build_compensations(self) -> dict:

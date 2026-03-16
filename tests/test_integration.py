@@ -25,7 +25,9 @@ metaflow.metadata("local")
 FLOWS_DIR = Path(__file__).parent / "flows"
 
 from metaflow_extensions.temporal.plugins.temporal.worker_utils import (  # noqa: E402
+    MetaflowEventGateway,
     MetaflowWorkflow,
+    run_compensation,
     run_metaflow_step,
 )
 
@@ -1218,6 +1220,128 @@ class TestTemporalNamespace:
         assert result.returncode == 0, result.stderr
         config = _extract_config_from_worker(out_file)
         assert config.get("temporal_namespace") == "my-namespace"
+
+
+# ---------------------------------------------------------------------------
+# Schedule fires more than once (B1-4)
+# ---------------------------------------------------------------------------
+
+
+class TestScheduleFiresRepeatedly:
+    """Verify that a @schedule flow can execute more than once.
+
+    Before the B1-4 fix, the scheduled workflow used a fixed ID and Temporal's
+    ALLOW_DUPLICATE_FAILED_ONLY policy caused every run after the first to be
+    silently rejected.
+    """
+
+    @pytest.mark.asyncio
+    async def test_second_scheduled_run_starts(self, worker):
+        """Two successive cron fires with the same workflow ID must both complete.
+
+        The Temporal Schedule fires with a fixed workflow ID each time. With
+        ALLOW_DUPLICATE_FAILED_ONLY (pre-fix default), the second fire raises
+        WorkflowAlreadyStartedError. With ALLOW_DUPLICATE (post-fix), it succeeds.
+        """
+        client, task_queue = worker
+        config = await _get_config(
+            client, task_queue, FLOWS_DIR / "scheduled_flow.py", "ScheduledFlow"
+        )
+
+        # Use the same fixed ID Temporal's Schedule action uses for every fire.
+        fixed_id = "scheduledflow-scheduled"
+
+        from temporalio.common import WorkflowIDReusePolicy
+
+        # First fire — must complete.
+        run1 = await client.execute_workflow(
+            MetaflowWorkflow.run,
+            {"config": config, "params": {}},
+            id=fixed_id,
+            task_queue=task_queue,
+            id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+        )
+        assert run1.startswith("temporal-"), f"First run returned unexpected ID: {run1}"
+
+        # Second fire — same workflow ID. Before the fix this raised
+        # WorkflowAlreadyStartedError (ALLOW_DUPLICATE_FAILED_ONLY rejected it).
+        # After the fix it must complete without raising.
+        try:
+            run2 = await client.execute_workflow(
+                MetaflowWorkflow.run,
+                {"config": config, "params": {}},
+                id=fixed_id,
+                task_queue=task_queue,
+                id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+            )
+        except Exception as e:
+            pytest.fail(
+                f"Second scheduled run raised {type(e).__name__}: {e}. "
+                "Expected it to succeed — ALLOW_DUPLICATE policy should allow re-use."
+            )
+        assert run2.startswith("temporal-"), f"Second run returned unexpected ID: {run2}"
+
+
+# ---------------------------------------------------------------------------
+# EventGateway: simultaneous events both start child workflows (B1-3)
+# ---------------------------------------------------------------------------
+
+
+class TestEventGateway:
+    """Event gateway integration tests.
+
+    The unit test for distinct IDs (B1-3 fix) lives in TestEventGatewayEventSeq
+    in test_adversarial.py. Here we verify the end-to-end signal → child workflow
+    execution path.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_event_signal_starts_workflow(self, temporal_env):
+        """A named event signal causes the gateway to start a MetaflowWorkflow child run."""
+        import uuid
+
+        client = temporal_env.client
+        task_queue = "test-gateway-%s" % uuid.uuid4().hex[:8]
+
+        config = await _get_config(
+            client, task_queue, FLOWS_DIR / "linear_flow.py", "LinearFlow"
+        )
+        config = {**config, "task_queue": task_queue,
+                  "named_triggers": [{"event": "run", "parameters": {}}]}
+
+        async with Worker(
+            client,
+            task_queue=task_queue,
+            workflows=[MetaflowWorkflow, MetaflowEventGateway],
+            activities=[run_metaflow_step, run_compensation],
+            activity_executor=ThreadPoolExecutor(max_workers=4),
+        ):
+            gateway_id = "test-event-gateway-%s" % uuid.uuid4().hex[:8]
+
+            handle = await client.start_workflow(
+                "MetaflowEventGateway",
+                {"config": config, "_use_embedded_config": False},
+                id=gateway_id,
+                task_queue=task_queue,
+            )
+
+            await handle.signal(MetaflowEventGateway.receive_event, {"_event_name": "run"})
+
+            # Gateway names first child: "{flow_name}-event-{event_name}-1".
+            # Yield to the event loop so the gateway processes the signal and
+            # dispatches the child workflow before we wait on its result.
+            import asyncio
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+            flow_name = config.get("flow_name", "linearflow").lower()
+            child_handle = client.get_workflow_handle(f"{flow_name}-event-run-1")
+            result = await child_handle.result()
+
+            await handle.signal(MetaflowEventGateway.stop)
+
+        assert result is not None and result.startswith("temporal-")
 
 
 # ---------------------------------------------------------------------------

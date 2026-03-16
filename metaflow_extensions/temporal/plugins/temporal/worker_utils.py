@@ -1302,6 +1302,7 @@ class MetaflowEventGateway:
     def __init__(self):
         self._pending: list = []   # [(event_name, payload_dict), ...]
         self._stop: bool = False
+        self._event_seq: int = 0   # monotonic counter for unique child workflow IDs
 
     @workflow.signal
     def receive_event(self, payload: dict) -> None:
@@ -1345,18 +1346,21 @@ class MetaflowEventGateway:
                     "Event gateway: received event '%s', starting workflow with params %r"
                     % (event_name, params)
                 )
+                self._event_seq += 1
                 await workflow.execute_child_workflow(
                     MetaflowWorkflow.run,
                     {
-                        "config": None,
+                        # Forward the resolved cfg so children don't need to
+                        # re-resolve via CONFIG (also makes the gateway testable
+                        # without a generated worker file).
+                        "config": cfg,
                         "params": params,
-                        "_use_embedded_config": True,
                     },
-                    id="%s-event-%s-%s"
+                    id="%s-event-%s-%d"
                     % (
                         cfg.get("flow_name", "flow").lower(),
                         event_name,
-                        workflow.now().strftime("%Y%m%d%H%M%S%f"),
+                        self._event_seq,
                     ),
                     task_queue=cfg.get("task_queue", ""),
                 )
@@ -1439,6 +1443,7 @@ class WorkerUtils:
             ScheduleOverlapPolicy,
             SchedulePolicy,
             ScheduleSpec,
+            WorkflowIDReusePolicy,
         )
 
         flow_name = config["flow_name"]
@@ -1459,6 +1464,7 @@ class WorkerUtils:
                         id="%s-scheduled" % flow_name.lower(),
                         task_queue=config["task_queue"],
                         execution_timeout=execution_timeout,
+                        id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
                     ),
                     spec=ScheduleSpec(
                         cron_expressions=[cron],
@@ -1485,6 +1491,9 @@ class WorkerUtils:
         since the last check are used as triggers.
         """
         seen_run_ids: set = set()
+        # Record start time so a worker restart doesn't re-fire for historical completions.
+        from datetime import datetime, timezone
+        poll_since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         while True:
             await asyncio.sleep(30)
@@ -1495,7 +1504,7 @@ class WorkerUtils:
                 prefix = "%s-" % upstream_name.lower()
                 try:
                     async for wf in await client.list_workflows(
-                        query='WorkflowType="MetaflowWorkflow" AND ExecutionStatus="Completed"'
+                        query='WorkflowType="MetaflowWorkflow" AND ExecutionStatus="Completed" AND CloseTime >= "%s"' % poll_since
                     ):
                         wf_id = wf.id
                         if not wf_id.startswith(prefix):
@@ -1505,15 +1514,15 @@ class WorkerUtils:
                         seen_run_ids.add(wf_id)
                         new_id = "%s-%s" % (config["flow_name"].lower(), uuid.uuid4().hex[:8])
                         try:
-                            result = await client.execute_workflow(
+                            await client.start_workflow(
                                 MetaflowWorkflow.run,
                                 {"config": config, "params": {}},
                                 id=new_id,
                                 task_queue=config["task_queue"],
                             )
                             print(
-                                "trigger_on_finish: triggered by %s -> run ID: %s"
-                                % (wf_id, result)
+                                "trigger_on_finish: triggered by %s -> workflow ID: %s"
+                                % (wf_id, new_id)
                             )
                         except Exception as trigger_err:
                             print(
