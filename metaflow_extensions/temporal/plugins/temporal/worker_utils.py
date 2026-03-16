@@ -1086,8 +1086,15 @@ class MetaflowWorkflow:
             #    prematurely execute the outer-level join (e.g. outer_join) from
             #    within this slice — that must be executed by _execute_node after
             #    ALL outer slices complete.
-            inner_body_node = steps[inner_body_step]
-            inner_join_step = inner_body_node["out_funcs"][0]
+            # Use _find_join_step on the CURRENT step (not inner_body_step) so that
+            # 3-level+ nesting resolves correctly: inner_body_step.out_funcs[0] is the
+            # body step it fans out to, not the join for THIS foreach level.
+            inner_join_step = _find_join_step(step_name, steps)
+            if inner_join_step is None:
+                inner_body_node = steps[inner_body_step]
+                inner_join_step = inner_body_node["out_funcs"][0] if inner_body_node.get("out_funcs") else None
+            if inner_join_step is None:
+                return task_ids
             inner_join_node = steps[inner_join_step]
             inner_join_input_paths = _resolve_input_paths(
                 inner_join_step, inner_join_node, run_id, task_ids, steps=steps
