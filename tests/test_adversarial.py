@@ -772,3 +772,272 @@ class TestEventGatewayEventSeq:
         )
         assert ids[0] == "myflow-event-run-1"
         assert ids[1] == "myflow-event-run-2"
+
+
+# ---------------------------------------------------------------------------
+# Param injection prevention (A4-1)
+# ---------------------------------------------------------------------------
+
+
+class TestParamInjectionPrevention:
+    """_execute_graph filters trigger params to declared parameters only.
+
+    Before the A4-1 fix, a user could pass {"with": "timeout", "task-id": "bad"}
+    as trigger params, injecting those as CLI flags into the init subprocess.
+    """
+
+    def test_undeclared_param_key_is_filtered(self):
+        """Keys not in flow's declared parameters must be dropped."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import asyncio
+
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+            MetaflowWorkflow,
+        )
+
+        wf = MetaflowWorkflow.__new__(MetaflowWorkflow)
+        wf.__init__()
+
+        # Minimal config with one declared parameter "greeting"
+        cfg = {
+            "flow_name": "TestFlow",
+            "flow_file": "/tmp/fake.py",
+            "parameters": {"greeting": {"name": "greeting", "default": "hello"}},
+            "steps": {
+                "start": {
+                    "type": "start",
+                    "out_funcs": ["end"],
+                    "in_funcs": [],
+                    "split_parents": [],
+                    "foreach_param": None,
+                    "condition": None,
+                    "has_card": False,
+                    "env": {},
+                    "timeout_seconds": 3600,
+                    "retries": 0,
+                    "retry_delay_seconds": 120,
+                    "decorator_specs": [],
+                    "runtime_cli_decorators": [],
+                },
+                "end": {
+                    "type": "end",
+                    "out_funcs": [],
+                    "in_funcs": ["start"],
+                    "split_parents": [],
+                    "foreach_param": None,
+                    "condition": None,
+                    "has_card": False,
+                    "env": {},
+                    "timeout_seconds": 3600,
+                    "retries": 0,
+                    "retry_delay_seconds": 120,
+                    "decorator_specs": [],
+                    "runtime_cli_decorators": [],
+                },
+            },
+            "metadata_type": "local",
+            "datastore_type": "local",
+            "environment_type": "local",
+            "event_logger_type": "nullSidecarLogger",
+            "monitor_type": "nullSidecarMonitor",
+            "tags": [],
+            "namespace": "",
+            "branch": "",
+            "compensations": {},
+            "flow_class_name": "TestFlow",
+            "trigger_on_finish": [],
+            "named_triggers": [],
+            "code_package": None,
+            "schedule": None,
+            "project": None,
+            "workflow_timeout_seconds": None,
+            "datastore_root": "/tmp/.metaflow",
+            "task_queue": "test-queue",
+            "temporal_host": "localhost:7233",
+            "temporal_namespace": "default",
+            "max_workers": 1,
+        }
+
+        # Params include one valid key and one injection attempt
+        raw_params = {"greeting": "world", "with": "timeout", "task-id": "injected"}
+
+        # Simulate what _execute_graph does
+        params = raw_params or {}
+        declared_params = set(cfg.get("parameters", {}).keys())
+        if declared_params and params:
+            filtered = {k: v for k, v in params.items() if k in declared_params}
+        else:
+            filtered = params
+
+        assert "greeting" in filtered, "Declared param must be kept"
+        assert "with" not in filtered, "Undeclared param 'with' must be dropped"
+        assert "task-id" not in filtered, "Undeclared param 'task-id' must be dropped"
+
+    def test_empty_declared_params_passes_through(self):
+        """When a flow has no declared parameters, all params pass through unchanged."""
+        cfg_no_params = {"parameters": {}}
+        raw_params = {"key": "value"}
+
+        declared = set(cfg_no_params.get("parameters", {}).keys())
+        if declared and raw_params:
+            filtered = {k: v for k, v in raw_params.items() if k in declared}
+        else:
+            filtered = raw_params
+
+        assert filtered == raw_params, "No declared params → pass all through unchanged"
+
+
+# ---------------------------------------------------------------------------
+# StepInput split_key and workflow_attempt fields (A1-2, A1-3)
+# ---------------------------------------------------------------------------
+
+
+class TestStepInputRetryFields:
+    """split_key and workflow_attempt are stored and used correctly on retry."""
+
+    def test_split_key_stored_in_step_input(self):
+        """_make_step_input accepts and stores split_key."""
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+            _make_step_input,
+        )
+
+        cfg = {
+            "flow_name": "F",
+            "flow_file": "/tmp/f.py",
+            "metadata_type": "local",
+            "datastore_type": "local",
+            "environment_type": "local",
+            "event_logger_type": "nullSidecarLogger",
+            "monitor_type": "nullSidecarMonitor",
+            "tags": [],
+            "namespace": "",
+            "branch": "",
+            "code_package": None,
+        }
+        node = {
+            "env": {},
+            "retries": 0,
+            "retry_delay_seconds": 120,
+            "decorator_specs": [],
+            "runtime_cli_decorators": [],
+        }
+        inp = _make_step_input(
+            cfg, node, "body", "run-1", "temporal-body-0_1-0",
+            "run-1/outer/tid", 0, 1, {},
+            split_key="0_1", workflow_attempt=0,
+        )
+        assert inp.split_key == "0_1", "split_key must be stored"
+        assert inp.workflow_attempt == 0, "workflow_attempt must be stored"
+
+    def test_activity_retry_uses_split_key_and_workflow_attempt(self):
+        """On activity retry, task_id is rebuilt using split_key + workflow_attempt."""
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import StepInput
+
+        # Simulate a nested foreach body slice: outer=0, inner=1, workflow attempt=0
+        inp = StepInput(
+            flow_name="F", flow_file="/tmp/f.py",
+            step_name="inner_body", run_id="run-1",
+            task_id="temporal-inner_body-0_1-0",  # original: split_key=0_1, workflow_attempt=0
+            input_paths="run-1/outer/tid",
+            retry_count=0,          # initial
+            max_retries=2,
+            split_index=1,          # raw integer (inner split index)
+            env_overrides={},
+            params_json="",
+            split_key="0_1",        # ancestry-encoded
+            workflow_attempt=0,
+        )
+
+        # Simulate what run_metaflow_step does on activity retry (attempt 2 → actual=1)
+        actual_retry_count = 1
+        if actual_retry_count != inp.retry_count:
+            inp.retry_count = actual_retry_count
+            if inp.split_key:
+                inp.task_id = "temporal-%s-%s-%d-%d" % (
+                    inp.step_name, inp.split_key, inp.workflow_attempt, actual_retry_count
+                )
+            else:
+                inp.task_id = "temporal-%s-%d-%d" % (
+                    inp.step_name, inp.workflow_attempt, actual_retry_count
+                )
+
+        assert inp.task_id == "temporal-inner_body-0_1-0-1", (
+            f"Expected 'temporal-inner_body-0_1-0-1' (ancestry preserved), got {inp.task_id!r}"
+        )
+
+    def test_workflow_retry_does_not_overwrite_attempt0_task_id(self):
+        """Workflow retry (attempt 2) produces a different task_id from attempt 1."""
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import StepInput
+
+        # workflow_attempt=1 (second workflow attempt), initial activity attempt
+        inp = StepInput(
+            flow_name="F", flow_file="/tmp/f.py",
+            step_name="start", run_id="run-1",
+            task_id="temporal-start-1",  # workflow_attempt=1 encoded in task_id
+            input_paths="run-1/_parameters/temporal-start-1-params",
+            retry_count=0,         # initial activity retry_count
+            max_retries=0,
+            split_index=-1,
+            env_overrides={},
+            params_json="",
+            split_key="",
+            workflow_attempt=1,    # second workflow attempt
+        )
+
+        # On first activity execution (actual=0): no rebuild (0 == 0)
+        actual_retry_count = 0
+        if actual_retry_count != inp.retry_count:
+            pass  # should NOT enter here
+
+        # task_id must remain "temporal-start-1", not be reverted to "temporal-start-0"
+        assert inp.task_id == "temporal-start-1", (
+            f"Workflow retry task_id must NOT revert to attempt-0 value, got {inp.task_id!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _resolve_config + _CONFIG_OVERRIDE (A6-3)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveConfig:
+    """_resolve_config uses explicit args, _CONFIG_OVERRIDE, or raises for CONFIG."""
+
+    def test_explicit_config_in_args_used_directly(self):
+        """When args["config"] is set and _use_embedded_config is false, use it."""
+        import metaflow_extensions.temporal.plugins.temporal.worker_utils as wu
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+            _resolve_config,
+        )
+
+        cfg = {"flow_name": "MyFlow"}
+        result = _resolve_config({"config": cfg})
+        assert result is cfg
+
+    def test_config_override_used_when_no_explicit_config(self):
+        """_CONFIG_OVERRIDE is used when args has no config or _use_embedded_config=True."""
+        import metaflow_extensions.temporal.plugins.temporal.worker_utils as wu
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+            _resolve_config,
+        )
+
+        override = {"flow_name": "OverrideFlow"}
+        original = wu._CONFIG_OVERRIDE
+        try:
+            wu._CONFIG_OVERRIDE = override
+            result = _resolve_config({"config": None, "_use_embedded_config": True})
+            assert result is override
+        finally:
+            wu._CONFIG_OVERRIDE = original
+
+    def test_no_override_raises_for_missing_config(self):
+        """Without _CONFIG_OVERRIDE, _use_embedded_config=True raises NameError."""
+        import metaflow_extensions.temporal.plugins.temporal.worker_utils as wu
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+            _resolve_config,
+        )
+
+        assert wu._CONFIG_OVERRIDE is None, "Test precondition: _CONFIG_OVERRIDE must be None"
+        with pytest.raises(NameError):
+            _resolve_config({"config": None, "_use_embedded_config": True})

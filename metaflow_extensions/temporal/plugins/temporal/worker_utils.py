@@ -25,6 +25,30 @@ from temporalio.exceptions import CancelledError as TemporalCancelledError
 from temporalio.worker import Worker
 
 # ---------------------------------------------------------------------------
+# Config resolution — allows tests to override the embedded CONFIG sentinel
+# ---------------------------------------------------------------------------
+
+# Set this in tests to override the CONFIG global (which is only defined in
+# generated worker files, not when importing worker_utils directly).
+# Example: import worker_utils as wu; wu._CONFIG_OVERRIDE = config
+_CONFIG_OVERRIDE: Optional[dict] = None
+
+
+def _resolve_config(args: dict) -> dict:
+    """Resolve workflow config from args, _CONFIG_OVERRIDE, or embedded CONFIG.
+
+    Priority: explicit args["config"] > _CONFIG_OVERRIDE > embedded CONFIG.
+    _CONFIG_OVERRIDE is used by tests to avoid the NameError for CONFIG.
+    """
+    cfg = args.get("config")
+    if cfg is not None and not args.get("_use_embedded_config"):
+        return cfg
+    if _CONFIG_OVERRIDE is not None:
+        return _CONFIG_OVERRIDE
+    return CONFIG  # noqa: F821 — defined in generated worker at runtime
+
+
+# ---------------------------------------------------------------------------
 # Tuneable constants
 # ---------------------------------------------------------------------------
 
@@ -89,6 +113,13 @@ class StepInput:
     namespace: str = ""
     # @project branch name (--branch flag for step subprocess)
     branch: str = ""
+    # Ancestry-encoded split key for nested foreach (e.g. "0_1" for outer=0, inner=1).
+    # Used when rebuilding task_id on activity retry so the ancestry context is preserved.
+    split_key: str = ""
+    # Workflow-level retry count (from workflow.info().attempt - 1).
+    # Kept separate from retry_count (activity-level) to prevent workflow retries
+    # from overwriting artifacts written by a previous workflow attempt.
+    workflow_attempt: int = 0
 
 
 @dataclass
@@ -477,12 +508,18 @@ async def run_metaflow_step(inp: StepInput) -> StepOutput:
     actual_retry_count = max(0, activity.info().attempt - 1)
     if actual_retry_count != inp.retry_count:
         inp.retry_count = actual_retry_count
-        # Rebuild the task_id to include the actual retry count so each Metaflow
-        # task attempt gets its own slot in the datastore.
-        if inp.split_index >= 0:
-            inp.task_id = "temporal-%s-%d-%d" % (inp.step_name, inp.split_index, actual_retry_count)
+        # Rebuild the task_id using the ancestry-encoded split_key (not the raw
+        # split_index integer) so nested foreach slices preserve their outer context,
+        # and include the workflow_attempt so workflow retries don't overwrite
+        # artifacts written by a prior workflow attempt.
+        if inp.split_key:
+            inp.task_id = "temporal-%s-%s-%d-%d" % (
+                inp.step_name, inp.split_key, inp.workflow_attempt, actual_retry_count
+            )
         else:
-            inp.task_id = "temporal-%s-%d" % (inp.step_name, actual_retry_count)
+            inp.task_id = "temporal-%s-%d-%d" % (
+                inp.step_name, inp.workflow_attempt, actual_retry_count
+            )
 
     output_fd, output_file = tempfile.mkstemp(suffix=".json")
     os.close(output_fd)
@@ -632,6 +669,8 @@ def _make_step_input(
     retry_count: int,
     split_index: int,
     params: dict,
+    split_key: str = "",
+    workflow_attempt: int = 0,
 ) -> StepInput:
     """Build a StepInput from compiled config, node config, and runtime values."""
     code_pkg = cfg.get("code_package") or {}
@@ -662,6 +701,8 @@ def _make_step_input(
         tags=cfg.get("tags", []),
         namespace=cfg.get("namespace", ""),
         branch=cfg.get("branch", ""),
+        split_key=split_key,
+        workflow_attempt=workflow_attempt,
     )
 
 
@@ -691,10 +732,13 @@ class MetaflowWorkflow:
 
     @workflow.run
     async def run(self, args: dict) -> str:
-        cfg = args.get("config")
-        if cfg is None or args.get("_use_embedded_config"):
-            cfg = CONFIG  # noqa: F821 — defined in generated worker at runtime
-        params = args.get("params", {})
+        cfg = _resolve_config(args)
+        params = args.get("params", {}) or {}
+        # Filter params to declared flow parameters only, preventing flag injection
+        # via keys like "with" or "task-id" that would become CLI flags.
+        declared_params = set(cfg.get("parameters", {}).keys())
+        if declared_params and params:
+            params = {k: v for k, v in params.items() if k in declared_params}
         resume_state = args.get("resume_state")  # {step_name: {"task_id": str}, ...}
         run_id_override = args.get("run_id_override")
         return await self._execute_graph(cfg, params, resume_state, run_id_override)
@@ -781,26 +825,40 @@ class MetaflowWorkflow:
             if step_name == "end":
                 return
             if node_type == "foreach":
-                body_step = node["out_funcs"][0]
-                body_node = steps[body_step]
-                join_step = body_node["out_funcs"][0]
-                await self._execute_node(join_step, cfg, run_id, task_ids, params, -1, resume_state)
+                out_funcs = node.get("out_funcs", [])
+                body_step = out_funcs[0] if out_funcs else None
+                if body_step and body_step in resume_state:
+                    # All body slices completed — use _find_join_step (same
+                    # algorithm as the live path) to locate the correct join.
+                    join_step = _find_join_step(step_name, steps)
+                    if join_step is None:
+                        body_node = steps.get(body_step, {})
+                        body_out = body_node.get("out_funcs", [])
+                        join_step = body_out[0] if body_out else None
+                    if join_step:
+                        await self._execute_node(
+                            join_step, cfg, run_id, task_ids, params, -1, resume_state
+                        )
+                    return
+                # Body slices incomplete — fall through and re-execute this
+                # foreach step from scratch (A2-3: partial fan-out resume).
+            else:
+                for next_step in node["out_funcs"]:
+                    await self._execute_node(next_step, cfg, run_id, task_ids, params, -1, resume_state)
                 return
-            for next_step in node["out_funcs"]:
-                await self._execute_node(next_step, cfg, run_id, task_ids, params, -1, resume_state)
-            return
 
         input_paths = _resolve_input_paths(step_name, node, run_id, task_ids, steps=steps)
 
-        retry_count = max(0, workflow.info().attempt - 1)
+        workflow_attempt = max(0, workflow.info().attempt - 1)
         if split_index >= 0:
-            task_id = "temporal-%s-%d-%d" % (step_name, split_index, retry_count)
+            task_id = "temporal-%s-%d-%d" % (step_name, split_index, workflow_attempt)
         else:
-            task_id = "temporal-%s-%d" % (step_name, retry_count)
+            task_id = "temporal-%s-%d" % (step_name, workflow_attempt)
 
         inp = _make_step_input(
             cfg, node, step_name, run_id, task_id, input_paths,
-            retry_count, split_index, params,
+            0, split_index, params,
+            workflow_attempt=workflow_attempt,
         )
         retry_policy = _make_retry_policy(node)
         timeout_seconds = node.get("timeout_seconds", _DEFAULT_STEP_TIMEOUT_SECONDS)
@@ -831,7 +889,7 @@ class MetaflowWorkflow:
             body_task_ids_list = await asyncio.gather(
                 *[
                     self._execute_foreach_slice(
-                        body_step, cfg, run_id, i, retry_count, dict(task_ids)
+                        body_step, cfg, run_id, i, workflow_attempt, dict(task_ids)
                     )
                     for i in range(cardinality)
                 ]
@@ -894,7 +952,7 @@ class MetaflowWorkflow:
 
             if chosen_branch:
                 branch_task_ids = await self._execute_branch_until_switch_merge(
-                    chosen_branch, cfg, run_id, retry_count,
+                    chosen_branch, cfg, run_id, workflow_attempt,
                     dict(task_ids), merge_step,
                 )
                 task_ids.update(branch_task_ids)
@@ -907,7 +965,7 @@ class MetaflowWorkflow:
             branch_results = await asyncio.gather(
                 *[
                     self._execute_branch_until_join(
-                        branch, cfg, run_id, retry_count, dict(shared_ids)
+                        branch, cfg, run_id, workflow_attempt, dict(shared_ids)
                     )
                     for branch in node["out_funcs"]
                 ]
@@ -970,7 +1028,10 @@ class MetaflowWorkflow:
         # For nested foreach:   "temporal-inner-0_0-0" (outer=0, inner=0, retry=0)
         full_split_key = "%s%d" % (slice_prefix, split_index)
         task_id = "temporal-%s-%s-%d" % (step_name, full_split_key, retry_count)
-        inp = _make_step_input(cfg, node, step_name, run_id, task_id, input_paths, retry_count, split_index, {})
+        inp = _make_step_input(
+            cfg, node, step_name, run_id, task_id, input_paths, 0, split_index, {},
+            split_key=full_split_key, workflow_attempt=retry_count,
+        )
         retry_policy = _make_retry_policy(node)
         timeout_seconds = node.get("timeout_seconds", _DEFAULT_STEP_TIMEOUT_SECONDS)
 
@@ -1036,7 +1097,8 @@ class MetaflowWorkflow:
             inner_join_inp = _make_step_input(
                 cfg, inner_join_node, inner_join_step, run_id,
                 inner_join_task_id, inner_join_input_paths,
-                retry_count, split_index, {}
+                0, split_index, {},
+                split_key=full_split_key, workflow_attempt=retry_count,
             )
             inner_join_timeout = inner_join_node.get("timeout_seconds", _DEFAULT_STEP_TIMEOUT_SECONDS)
             inner_join_out: StepOutput = await workflow.execute_activity(
@@ -1070,7 +1132,10 @@ class MetaflowWorkflow:
         node = steps[step_name]
         input_paths = _resolve_input_paths(step_name, node, run_id, task_ids, steps=steps)
         task_id = "temporal-%s-%d" % (step_name, retry_count)
-        inp = _make_step_input(cfg, node, step_name, run_id, task_id, input_paths, retry_count, -1, {})
+        inp = _make_step_input(
+            cfg, node, step_name, run_id, task_id, input_paths, 0, -1, {},
+            workflow_attempt=retry_count,
+        )
         timeout_seconds = node.get("timeout_seconds", _DEFAULT_STEP_TIMEOUT_SECONDS)
 
         out: StepOutput = await workflow.execute_activity(
@@ -1188,15 +1253,27 @@ def _resolve_input_paths(
         return ""
 
     # Foreach join: the body step's task_ids is a list of per-slice task_ids.
-    # Detect this by checking whether the first parent's recorded task_ids is a list
-    # (set by _execute_node after gathering all slices).
+    # Guard with a split_parents type-check so regular split joins (whose
+    # split_parents point to a "split" node, not "foreach") don't enter this
+    # path — their branch task_ids are strings, not lists (A2-2 regression fix).
     if node["type"] == "join" and node.get("split_parents"):
-        body_step = in_funcs[0]
-        split_ids = task_ids.get(body_step)
-        if isinstance(split_ids, list):
-            return ",".join(
-                "%s/%s/%s" % (run_id, body_step, tid) for tid in split_ids
-            )
+        split_parent = (node["split_parents"] or [None])[-1]
+        is_foreach_join = (
+            split_parent is not None
+            and steps is not None
+            and steps.get(split_parent, {}).get("type") == "foreach"
+        )
+        if is_foreach_join:
+            body_step = in_funcs[0]
+            split_ids = task_ids.get(body_step)
+            if split_ids is not None:
+                # Normalise to list: resume_state may have stored a single string
+                # task_id when cardinality was 1 (A2-2).
+                if not isinstance(split_ids, list):
+                    split_ids = [split_ids]
+                return ",".join(
+                    "%s/%s/%s" % (run_id, body_step, tid) for tid in split_ids
+                )
 
     if len(in_funcs) == 1:
         parent = in_funcs[0]
@@ -1318,9 +1395,7 @@ class MetaflowEventGateway:
     @workflow.run
     async def run(self, args: dict) -> None:
         """Process incoming event signals until stopped."""
-        cfg = args.get("config")
-        if cfg is None or args.get("_use_embedded_config"):
-            cfg = CONFIG  # noqa: F821 — defined in generated worker at runtime
+        cfg = _resolve_config(args)
         named_triggers = cfg.get("named_triggers", [])
         # Build lookup: event_name -> parameter_map dict
         trigger_map = {}

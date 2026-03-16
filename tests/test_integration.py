@@ -1345,6 +1345,87 @@ class TestEventGateway:
 
 
 # ---------------------------------------------------------------------------
+# Foreach resume: cardinality-1 resume (A2-2) and partial fan-out (A2-3)
+# ---------------------------------------------------------------------------
+
+
+class TestForeachResume:
+    """Foreach resume produces correct input paths under edge cases.
+
+    A2-2: when resume_state stores task_id as a string (cardinality=1 foreach),
+    _resolve_input_paths must not return a single path — it must normalise to
+    a list and produce the join's correct single input.
+
+    A2-3: when a foreach spawner completed but body slices didn't, resume must
+    re-execute the full fan-out rather than jumping to the join with incomplete
+    inputs.
+    """
+
+    def test_resolve_input_paths_foreach_join_with_string_task_id(self):
+        """Foreach join normalises a string body task_id to a single-element list (A2-2)."""
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+            _resolve_input_paths,
+        )
+
+        steps = {
+            "spawner": {"type": "foreach", "out_funcs": ["body"], "in_funcs": ["start"], "split_parents": []},
+            "body": {"type": "foreach_step", "out_funcs": ["join"], "in_funcs": ["spawner"], "split_parents": ["spawner"]},
+            "join": {"type": "join", "out_funcs": ["end"], "in_funcs": ["body"], "split_parents": ["spawner"]},
+        }
+        node = steps["join"]
+        # Resume stored body as a single string (cardinality=1 or old _do_resume format)
+        task_ids = {"body": "temporal-body-0"}
+
+        paths = _resolve_input_paths("join", node, "run-1", task_ids, steps=steps)
+
+        assert paths == "run-1/body/temporal-body-0", (
+            f"Expected single normalised path, got: {paths!r}"
+        )
+
+    def test_resolve_input_paths_foreach_join_with_list_task_ids(self):
+        """Foreach join with a list task_ids produces comma-separated paths."""
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+            _resolve_input_paths,
+        )
+
+        steps = {
+            "spawner": {"type": "foreach", "out_funcs": ["body"], "in_funcs": ["start"], "split_parents": []},
+            "body": {"type": "foreach_step", "out_funcs": ["join"], "in_funcs": ["spawner"], "split_parents": ["spawner"]},
+            "join": {"type": "join", "out_funcs": ["end"], "in_funcs": ["body"], "split_parents": ["spawner"]},
+        }
+        node = steps["join"]
+        task_ids = {"body": ["temporal-body-0-0", "temporal-body-1-0", "temporal-body-2-0"]}
+
+        paths = _resolve_input_paths("join", node, "run-1", task_ids, steps=steps)
+
+        assert paths == "run-1/body/temporal-body-0-0,run-1/body/temporal-body-1-0,run-1/body/temporal-body-2-0"
+
+    def test_resolve_input_paths_regular_split_join_not_affected(self):
+        """Regular split/join (not foreach) still receives all branch paths (A2-2 regression)."""
+        from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
+            _resolve_input_paths,
+        )
+
+        steps = {
+            "split": {"type": "split", "out_funcs": ["branch_a", "branch_b"], "in_funcs": ["start"], "split_parents": []},
+            "branch_a": {"type": "linear", "out_funcs": ["join"], "in_funcs": ["split"], "split_parents": ["split"]},
+            "branch_b": {"type": "linear", "out_funcs": ["join"], "in_funcs": ["split"], "split_parents": ["split"]},
+            "join": {"type": "join", "out_funcs": ["end"], "in_funcs": ["branch_a", "branch_b"], "split_parents": ["split"]},
+        }
+        node = steps["join"]
+        task_ids = {
+            "branch_a": "temporal-branch_a-0",
+            "branch_b": "temporal-branch_b-0",
+        }
+
+        paths = _resolve_input_paths("join", node, "run-1", task_ids, steps=steps)
+
+        assert "branch_a/temporal-branch_a-0" in paths
+        assert "branch_b/temporal-branch_b-0" in paths
+        assert paths.count(",") == 1, f"Expected exactly 2 paths, got: {paths!r}"
+
+
+# ---------------------------------------------------------------------------
 # Tier 2: external Temporal server tests
 # ---------------------------------------------------------------------------
 
