@@ -4,7 +4,6 @@ import os
 import warnings
 from datetime import datetime
 
-from metaflow.decorators import StepDecorator
 
 try:
     from metaflow.plugins.timeout_decorator import get_run_time_limit_for_task
@@ -17,9 +16,10 @@ from .exception import TemporalException
 WORKER_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "worker_template.mustache")
 
 # Decorators that must NOT be forwarded as --with specs to step subprocesses.
-# These decorators either have no meaning inside a step subprocess (schedule,
-# project, trigger) or are already handled via runtime_step_cli hooks (sandbox,
-# daytona, e2b, boxlite) — forwarding them would cause double step_init.
+# These are either handled natively by Temporal (retry, timeout, environment)
+# or have no meaning inside a step subprocess (schedule, project, trigger).
+# All other decorators (conda, kubernetes, sandbox, etc.) are forwarded as
+# --with flags so Metaflow manages its own decorator lifecycle.
 # NOTE: @resources is intentionally excluded here; resource hints are emitted
 # as a structured "resources" entry in the per-step config and forwarded to
 # compute backends (e.g. @kubernetes) via the decorator_specs list.
@@ -86,7 +86,6 @@ class Temporal:
         self.task_queue = task_queue or (
             "metaflow-{}".format(self._effective_flow_name.lower().replace(".", "-"))
         )
-        self._code_package_info = None
 
     @property
     def _effective_flow_name(self) -> str:
@@ -157,34 +156,7 @@ class Temporal:
             # @trigger(event="foo"): named events that start this workflow via a Temporal signal.
             # Each entry: {"event": "<event_name>", "parameters": {<flow_param>: <event_field>}}.
             "named_triggers": self._get_named_triggers(),
-            # Uploaded code package metadata for remote runtime decorators
-            # (e.g. sandbox/daytona/e2b, batch, kubernetes).
-            "code_package": self._get_code_package_info(),
         }
-
-    def _get_code_package_info(self) -> dict | None:
-        if self._code_package_info is not None:
-            return self._code_package_info
-        try:
-            from metaflow.package import MetaflowPackage
-
-            package = MetaflowPackage(
-                self.flow,
-                self.environment,
-                echo=lambda *args, **kwargs: None,
-                flow_datastore=self.flow_datastore,
-            )
-            package_url, package_sha = self.flow_datastore.save_data(
-                [package.blob], len_hint=1
-            )[0]
-            self._code_package_info = {
-                "url": package_url,
-                "sha": package_sha,
-                "metadata": package.package_metadata,
-            }
-        except Exception:
-            self._code_package_info = None
-        return self._code_package_info
 
     def _process_parameters(self) -> dict:
         """Extract flow parameters."""
@@ -232,10 +204,10 @@ class Temporal:
                 "retry_delay_seconds": self._get_retry_delay(node),
                 # Decorator backend specs, e.g. ["kubernetes:image=python:3.11,cpu=2"].
                 # Forwarded as --with=<spec> flags to the step subprocess.
+                # Only compute/environment decorators are included — decorators
+                # handled natively by Temporal (retry, timeout, environment) are
+                # excluded.  Metaflow manages its own decorator lifecycle.
                 "decorator_specs": self._get_decorator_specs(node),
-                # Serialized initialized decorator state used to invoke
-                # runtime_step_cli hooks in the worker process.
-                "runtime_cli_decorators": self._get_runtime_cli_decorators(node),
             }
         return steps
 
@@ -290,62 +262,6 @@ class Temporal:
             except Exception:
                 pass
         return specs
-
-    def _get_runtime_cli_decorators(self, node) -> list:
-        """Serialize initialized decorator objects that override runtime_step_cli."""
-        snapshots = []
-        seen = set()
-        skip_state_keys = {
-            "flow",
-            "graph",
-            "package",
-            "metadata",
-            "task_datastore",
-            "flow_datastore",
-            "logger",
-            "echo",
-        }
-        for d in self._iter_step_decorators(node):
-            name = getattr(d, "name", None)
-            if not name or name == "temporal_internal":
-                continue
-            try:
-                if d.__class__.runtime_step_cli is StepDecorator.runtime_step_cli:
-                    continue
-            except Exception:
-                continue
-
-            key = (d.__class__.__module__, d.__class__.__name__, name)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            state = {}
-            for k, v in getattr(d, "__dict__", {}).items():
-                if k in skip_state_keys:
-                    continue
-                try:
-                    json.dumps(v)
-                except Exception:
-                    warnings.warn(
-                        f"Decorator '{name}' field '{k}' is not JSON-serializable and "
-                        "will not be forwarded to the worker. Runtime behavior "
-                        "may differ if this field is required by runtime_step_cli.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-                    continue
-                state[k] = v
-
-            snapshots.append(
-                {
-                    "name": name,
-                    "module": d.__class__.__module__,
-                    "class": d.__class__.__name__,
-                    "state": state,
-                }
-            )
-        return snapshots
 
     def _step_env(self, node) -> dict:
         """Build METAFLOW_* env vars needed at step execution time."""

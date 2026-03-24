@@ -96,17 +96,12 @@ class StepInput:
     environment_type: str = "local"
     event_logger_type: str = "nullSidecarLogger"
     monitor_type: str = "nullSidecarMonitor"
-    # Uploaded code package metadata (for remote runtime decorators that
-    # launch code in external backends).
-    code_package_url: str = ""
-    code_package_sha: str = ""
-    code_package_metadata: str = ""
     # Decorator backend specs forwarded as --with flags (e.g. "kubernetes:cpu=4",
     # "sandbox:backend=daytona", "conda:packages=['numpy']").
+    # Only compute/environment decorators are included — decorators handled
+    # natively by Temporal (retry, timeout, environment) are excluded.
+    # Metaflow manages its own decorator lifecycle inside the step subprocess.
     decorator_specs: Optional[List[str]] = None
-    # Serialized initialized step decorators (compile-time snapshot) used to
-    # invoke runtime_step_cli hooks in this worker process.
-    runtime_cli_decorators: Optional[List[dict]] = None
     # Run tags forwarded as --tag flags to each step subprocess
     tags: Optional[List[str]] = None
     # Metaflow namespace (--namespace flag for step subprocess)
@@ -188,150 +183,46 @@ def _top_level_args(inp: StepInput) -> list:
     return args
 
 
-class _RuntimeCLIArgs:
-    """Minimal CLIArgs shim for StepDecorator.runtime_step_cli hooks."""
-
-    def __init__(self, inp: StepInput, input_paths: str):
-        self.entrypoint = [sys.executable, inp.flow_file]
-        self.top_level_options = {
-            "quiet": True,
-            "pylint": False,
-            "metadata": inp.metadata_type,
-            "environment": inp.environment_type,
-            "datastore": inp.datastore_type,
-            "datastore-root": _datastore_root_arg(inp.env_overrides, inp.datastore_type),
-            "event-logger": inp.event_logger_type,
-            "monitor": inp.monitor_type,
-            "with": list(inp.decorator_specs or []) + ["temporal_internal"],
-            **({"branch": inp.branch} if inp.branch else {}),
-        }
-        self.commands = ["step"]
-        self.command_args = [inp.step_name]
-        self.command_options = {
-            "run-id": inp.run_id,
-            "task-id": inp.task_id,
-            "retry-count": inp.retry_count,
-            "max-user-code-retries": inp.max_retries,
-            "input-paths": input_paths,
-            "split-index": inp.split_index if inp.split_index >= 0 else None,
-            "tag": list(inp.tags or []),
-        }
-        self.env = {}
-
-    def get_args(self) -> list:
-        def _options(mapping):
-            for k, v in mapping.items():
-                if v is None or v is False:
-                    continue
-                k = k.replace("_", "-")
-                values = v if isinstance(v, (list, tuple, set)) else [v]
-                for value in values:
-                    yield "--%s" % k
-                    if not isinstance(value, bool):
-                        yield str(value)
-
-        args = list(self.entrypoint)
-        args.extend(_options(self.top_level_options))
-        args.extend(self.commands)
-        args.extend(self.command_args)
-        args.extend(_options(self.command_options))
-        return args
-
-
-def _runtime_step_decorators(inp: StepInput) -> list:
-    """Resolve StepDecorator instances for runtime_step_cli hooks."""
-    try:
-        import importlib
-
-        from metaflow.decorators import StepDecorator, extract_step_decorator_from_decospec
-    except Exception:
-        return []
-
-    # Preferred path: use compile-time initialized decorator snapshots.
-    decorators = []
-    for snap in (inp.runtime_cli_decorators or []):
-        try:
-            module_name = snap.get("module")
-            class_name = snap.get("class")
-            if not module_name or not class_name:
-                continue
-            module = importlib.import_module(module_name)
-            deco_cls = getattr(module, class_name)
-            deco = deco_cls()
-            if not isinstance(deco, StepDecorator):
-                continue
-            state = snap.get("state", {})
-            if isinstance(state, dict):
-                deco.__dict__.update(state)
-            # Some decorators expect package pointers from runtime_init/task_created.
-            # Hydrate both class-level and instance-level fields when available.
-            for attr, value in (
-                ("package_url", inp.code_package_url),
-                ("package_sha", inp.code_package_sha),
-                ("package_metadata", inp.code_package_metadata),
-            ):
-                if value:
-                    try:
-                        setattr(deco.__class__, attr, value)
-                    except Exception:
-                        pass
-                    try:
-                        if getattr(deco, attr, None) in (None, ""):
-                            setattr(deco, attr, value)
-                    except Exception:
-                        pass
-            # Call external_init so decorators that launch remote runtimes can
-            # initialize themselves (e.g. resolve credentials, set endpoints).
-            try:
-                deco.external_init()
-            except Exception as exc:
-                # Decorator failed to initialize (e.g. missing credentials).
-                # Skip it — using a partially-initialized decorator would produce
-                # malformed CLI arguments and silent failures.
-                deco_name = snap.get("name") or class_name
-                print(
-                    "Warning: skipping decorator '%s' because external_init() "
-                    "raised: %s" % (deco_name, exc),
-                    file=sys.stderr,
-                )
-                continue
-            decorators.append(deco)
-        except Exception:
-            continue
-    if decorators:
-        return decorators
-
-    # Fallback path: parse raw --with specs.
-    for spec in (inp.decorator_specs or []):
-        try:
-            deco, _ = extract_step_decorator_from_decospec(spec)
-            if isinstance(deco, StepDecorator):
-                deco.external_init()
-                decorators.append(deco)
-        except Exception:
-            # Unknown or unavailable decorator modules are already represented
-            # as --with flags; skip hook invocation and let CLI handle it.
-            continue
-    return decorators
-
-
 def _build_step_cmd(inp: StepInput, input_paths: str) -> tuple:
-    """Return (argv, extra_env) for a step execution."""
-    cli_args = _RuntimeCLIArgs(inp, input_paths)
-    for deco in _runtime_step_decorators(inp):
-        try:
-            deco.runtime_step_cli(
-                cli_args,
-                inp.retry_count,
-                inp.max_retries,
-                None,  # ubf_context
-            )
-        except Exception:
-            # Some decorators need additional runtime lifecycle hooks (e.g.
-            # runtime_init/runtime_task_created) before runtime_step_cli.
-            # Fall back to standard local step execution when unavailable.
-            continue
-    return cli_args.get_args(), dict(cli_args.env)
+    """Return (argv, extra_env) for a step execution.
+
+    All compute/environment decorators are forwarded as --with flags to the
+    Metaflow CLI subprocess, letting Metaflow manage its own decorator
+    lifecycle.  Decorators handled natively by Temporal (retry, timeout,
+    environment) are excluded at compile time.
+    """
+    top_level = _top_level_args(inp)
+
+    def _options(mapping):
+        for k, v in mapping.items():
+            if v is None or v is False:
+                continue
+            k = k.replace("_", "-")
+            values = v if isinstance(v, (list, tuple, set)) else [v]
+            for value in values:
+                yield "--%s" % k
+                if not isinstance(value, bool):
+                    yield str(value)
+
+    command_options = {
+        "run-id": inp.run_id,
+        "task-id": inp.task_id,
+        "retry-count": inp.retry_count,
+        "max-user-code-retries": inp.max_retries,
+        "input-paths": input_paths,
+        "split-index": inp.split_index if inp.split_index >= 0 else None,
+        "tag": list(inp.tags or []),
+    }
+
+    args = [sys.executable, inp.flow_file]
+    args.extend(top_level)
+    # Forward compute/environment decorators as --with flags
+    for spec in (inp.decorator_specs or []):
+        args.extend(["--with", spec])
+    args.extend(["--with", "temporal_internal"])
+    args.extend(["step", inp.step_name])
+    args.extend(_options(command_options))
+    return args, {}
 
 
 def _build_init_cmd(inp: StepInput, params_task_id: str, params: dict) -> list:
@@ -673,7 +564,6 @@ def _make_step_input(
     workflow_attempt: int = 0,
 ) -> StepInput:
     """Build a StepInput from compiled config, node config, and runtime values."""
-    code_pkg = cfg.get("code_package") or {}
     env_overrides = dict(node.get("env", {}))
     env_overrides["METAFLOW_RUN_ID"] = run_id
     return StepInput(
@@ -693,11 +583,7 @@ def _make_step_input(
         environment_type=cfg.get("environment_type", "local"),
         event_logger_type=cfg.get("event_logger_type", "nullSidecarLogger"),
         monitor_type=cfg.get("monitor_type", "nullSidecarMonitor"),
-        code_package_url=code_pkg.get("url", ""),
-        code_package_sha=code_pkg.get("sha", ""),
-        code_package_metadata=code_pkg.get("metadata", ""),
         decorator_specs=node.get("decorator_specs", []),
-        runtime_cli_decorators=node.get("runtime_cli_decorators", []),
         tags=cfg.get("tags", []),
         namespace=cfg.get("namespace", ""),
         branch=cfg.get("branch", ""),
