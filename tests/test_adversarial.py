@@ -576,7 +576,6 @@ class TestCompilerWarnings:
 
     def _make_temporal(self, flow, graph, flow_file="/tmp/fake.py"):
         """Build a minimal Temporal compiler instance."""
-        import os
         from unittest.mock import MagicMock
 
         from metaflow_extensions.temporal.plugins.temporal.temporal import Temporal
@@ -608,7 +607,7 @@ class TestCompilerWarnings:
         """_get_schedule should emit a UserWarning (not silently return None) when
         the schedule decorator accessor raises."""
         import warnings
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
 
         from metaflow_extensions.temporal.plugins.temporal.temporal import Temporal
 
@@ -765,7 +764,7 @@ class TestEventGatewayEventSeq:
         ids = []
         for _ in range(2):
             seq += 1
-            ids.append("%s-event-%s-%d" % (flow_name, event_name, seq))
+            ids.append(f"{flow_name}-event-{event_name}-{seq}")
 
         assert ids[0] != ids[1], (
             f"Two successive event IDs must be distinct, got: {ids}"
@@ -788,9 +787,7 @@ class TestParamInjectionPrevention:
 
     def test_undeclared_param_key_is_filtered(self):
         """Keys not in flow's declared parameters must be dropped."""
-        from unittest.mock import AsyncMock, MagicMock, patch
 
-        import asyncio
 
         from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
             MetaflowWorkflow,
@@ -954,12 +951,14 @@ class TestStepInputRetryFields:
         if actual_retry_count != inp.retry_count:
             inp.retry_count = actual_retry_count
             if inp.split_key:
-                inp.task_id = "temporal-%s-%s-%d-%d" % (
-                    inp.step_name, inp.split_key, inp.workflow_attempt, actual_retry_count
+                inp.task_id = (
+                    f"temporal-{inp.step_name}-{inp.split_key}-"
+                    f"{inp.workflow_attempt}-{actual_retry_count}"
                 )
             else:
-                inp.task_id = "temporal-%s-%d-%d" % (
-                    inp.step_name, inp.workflow_attempt, actual_retry_count
+                inp.task_id = (
+                    f"temporal-{inp.step_name}-{inp.workflow_attempt}-"
+                    f"{actual_retry_count}"
                 )
 
         assert inp.task_id == "temporal-inner_body-0_1-0-1", (
@@ -1006,7 +1005,6 @@ class TestResolveConfig:
 
     def test_explicit_config_in_args_used_directly(self):
         """When args["config"] is set and _use_embedded_config is false, use it."""
-        import metaflow_extensions.temporal.plugins.temporal.worker_utils as wu
         from metaflow_extensions.temporal.plugins.temporal.worker_utils import (
             _resolve_config,
         )

@@ -1302,7 +1302,7 @@ class TestEventGateway:
         import uuid
 
         client = temporal_env.client
-        task_queue = "test-gateway-%s" % uuid.uuid4().hex[:8]
+        task_queue = f"test-gateway-{uuid.uuid4().hex[:8]}"
 
         config = await _get_config(
             client, task_queue, FLOWS_DIR / "linear_flow.py", "LinearFlow"
@@ -1317,7 +1317,7 @@ class TestEventGateway:
             activities=[run_metaflow_step, run_compensation],
             activity_executor=ThreadPoolExecutor(max_workers=4),
         ):
-            gateway_id = "test-event-gateway-%s" % uuid.uuid4().hex[:8]
+            gateway_id = f"test-event-gateway-{uuid.uuid4().hex[:8]}"
 
             handle = await client.start_workflow(
                 "MetaflowEventGateway",
