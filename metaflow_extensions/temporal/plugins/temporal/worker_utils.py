@@ -115,6 +115,12 @@ class StepInput:
     # Kept separate from retry_count (activity-level) to prevent workflow retries
     # from overwriting artifacts written by a previous workflow attempt.
     workflow_attempt: int = 0
+    # Code package metadata forwarded to the step subprocess so it can fetch
+    # the user code bundle that the deployer uploaded at deploy time. Empty
+    # strings mean no code package (e.g. local execution without S3).
+    code_package_url: str = ""
+    code_package_sha: str = ""
+    code_package_metadata: str = ""
 
 
 @dataclass
@@ -566,6 +572,9 @@ def _make_step_input(
     """Build a StepInput from compiled config, node config, and runtime values."""
     env_overrides = dict(node.get("env", {}))
     env_overrides["METAFLOW_RUN_ID"] = run_id
+    # cfg["code_package"] is None when the deployer didn't upload a bundle
+    # (local execution without S3); be defensive about partial dicts.
+    code_package = cfg.get("code_package") or {}
     return StepInput(
         flow_name=cfg["flow_name"],
         flow_file=cfg["flow_file"],
@@ -589,6 +598,9 @@ def _make_step_input(
         branch=cfg.get("branch", ""),
         split_key=split_key,
         workflow_attempt=workflow_attempt,
+        code_package_url=code_package.get("url", ""),
+        code_package_sha=code_package.get("sha", ""),
+        code_package_metadata=code_package.get("metadata", ""),
     )
 
 
