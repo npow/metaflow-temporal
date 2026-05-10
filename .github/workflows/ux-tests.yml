@@ -26,9 +26,9 @@ jobs:
           cache: "pip"
       - name: Pin Metaflow local datastore root
         run: echo "METAFLOW_DATASTORE_SYSROOT_LOCAL=$HOME" >> "$GITHUB_ENV"
-      - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
+      - uses: Netflix/metaflow/.github/actions/run-ux-tests@master
         with:
-          metaflow-ref: npow/corral-devstack
+          metaflow-ref: master
           extra-install: "."
           codecov-token: ${{ secrets.CODECOV_TOKEN }}
           pytest-args: "-n 4 -v --tb=short --timeout=300 -k 'runner' --cov-fail-under=0"
@@ -94,9 +94,9 @@ jobs:
               sys.exit(1)
           asyncio.run(wait())
           EOF
-      - uses: Netflix/metaflow/.github/actions/run-ux-tests@npow/corral-devstack
+      - uses: Netflix/metaflow/.github/actions/run-ux-tests@master
         with:
-          metaflow-ref: npow/corral-devstack
+          metaflow-ref: master
           extra-install: "."
           pytest-args: "-v --tb=short --timeout=300 -k '${{ matrix.test }} and deployer' --cov-fail-under=0"
           coverage-artifact-suffix: ${{ matrix.test }}
